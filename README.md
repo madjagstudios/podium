@@ -1,10 +1,19 @@
 # Podium
 
+[![CI](https://github.com/madjagstudios/podium/actions/workflows/ci.yml/badge.svg)](https://github.com/madjagstudios/podium/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/madjagstudios/podium?display_name=release)](https://github.com/madjagstudios/podium/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Claude Code mod](https://img.shields.io/badge/Claude%20Code-mod-d97757)](#install)
+
 Podium is a mod for Claude Code. It lets Claude hand work to the other coding agents on your machine (Codex, Muse, Gemini, other Claude models, or any agent with a command line) and shows all of it in one pane inside Claude Code.
 
 I built it because I was using several agents at once and losing track of them. I'd have one reviewing a branch in one terminal and another writing tests in a second, and I was copying results back into Claude by hand. With Podium I ask Claude in plain words, the agents run in the background, and the results come back to the chat when they finish.
 
 ## What it looks like
+
+![Claude hands a read-only review to Codex; the Podium pane shows it working, then the result](assets/demo.gif)
+
+*The middle is sped up 8×.*
 
 > **You:** have Codex review this branch, read only, and have Claude Sonnet add tests for the payout code
 
