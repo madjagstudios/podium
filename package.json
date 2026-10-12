@@ -1,0 +1,20 @@
+{
+  "name": "podium",
+  "version": "0.4.0",
+  "description": "Orchestrator mod for Claude Code: dispatch work to any installed agent CLI and track it in one pane.",
+  "license": "MIT",
+  "author": "MadJag Studios",
+  "homepage": "https://github.com/madjagstudios/podium",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/madjagstudios/podium.git"
+  },
+  "bugs": {
+    "url": "https://github.com/madjagstudios/podium/issues"
+  },
+  "type": "module",
+  "private": true,
+  "bin": { "podium": "bin/podium.js" },
+  "engines": { "node": ">=22" },
+  "scripts": { "test": "node scripts/test.js" }
+}

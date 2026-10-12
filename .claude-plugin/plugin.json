@@ -1,0 +1,12 @@
+{
+  "name": "podium",
+  "version": "0.4.0",
+  "description": "Hand work to any agent CLI on your machine and see and control it from one pane.",
+  "author": {
+    "name": "MadJag Studios"
+  },
+  "homepage": "https://github.com/madjagstudios/podium",
+  "repository": "https://github.com/madjagstudios/podium",
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}

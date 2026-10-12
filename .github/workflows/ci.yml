@@ -1,0 +1,21 @@
+name: ci
+on:
+  # PRs, and main after a merge; a branch push without a PR runs nothing.
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # The OSes differ where Podium works (paths, .cmd shims, process kills); one Node, the floor.
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: git config --global user.name ci && git config --global user.email ci@example.com
+      - run: npm test
