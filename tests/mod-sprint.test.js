@@ -254,3 +254,12 @@ test('the sprint tool refuses an "after" that is not a list of ticket keys, plai
   assert.throws(() => engineCall('sprint', { action: 'after', id: 's1', after: [] }), { message: 'Say which ticket.' });
   assert.deepEqual(engineCall('sprint', { action: 'after', id: 's1', ticket: 'ABC-15', after: [' ABC-14 '] }).args.slice(-2), ['--keys', 'ABC-14']);
 });
+
+// A park on a locked file reads as an ordinary park on the board and in the tool's text;
+// the release-and-retry flow lives on the ticket's own screen.
+test('a board row for a ticket parked on a locked file reads as an ordinary park', () => {
+  const reason = "Podium couldn't finish saving changes because x.dll is still open in a program. Close the program holding the file, then Retry. The ticket's copy and any stash Git made have been kept.";
+  const ticket = { key: 'ABC-13', title: 'Settings screen', state: 'parked', task: 2, of: 3, phase: null, agent: 'claude', reason, findings: null, pr: null, reviews: 1, checkpointLock: { file: 'x.dll', hint: null, stashBefore: null, stashAfter: 'abc1234' } };
+  assert.deepEqual(sprintLines({ ...SUM, tickets: [ticket] }).slice(1), [`ABC-13  Settings screen  ✋ ${reason}`]);
+  assert.deepEqual(sprintLines(sprintCard({ ...SUM, tickets: [ticket] })).slice(1), [`ABC-13  Settings screen  ✋ ${reason.slice(0, 159)}…`], 'as its card, with the reason cut as usual');
+});

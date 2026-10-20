@@ -27,10 +27,18 @@ export function dataSize(dir) {
 
 const jobsIn = (root) => listJobDirs(root).map((dir) => readJob(dir));
 
+// The data folder, plus the copies kept outside it (a copies folder of its own), which uninstall removes too.
+function removedSize(root, jobs) {
+  const outside = (dir) => { const rel = path.relative(root, dir); return rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel); };
+  // A follow-up or a sprint's next step works in the same copy as the step before it: each copy counts once.
+  const elsewhere = new Set(jobs.map((j) => j.worktree).filter((dir) => dir && outside(dir) && fs.existsSync(dir)));
+  return dataSize(root) + [...elsewhere].reduce((sum, dir) => sum + dataSize(dir), 0);
+}
+
 export function removalPlan(root) {
   const jobs = jobsIn(root);
   return {
-    bytes: dataSize(root),
+    bytes: removedSize(root, jobs),
     unkept: jobs.filter((j) => j.status === 'needs-review').length,
     running: jobs.filter((j) => RUNNING.has(j.status)).length,
     copies: jobs.filter((j) => j.worktree && fs.existsSync(j.worktree)).length,
@@ -38,7 +46,7 @@ export function removalPlan(root) {
 }
 
 export async function uninstall(root) {
-  const bytes = dataSize(root);
+  const bytes = removedSize(root, jobsIn(root));
   const left = [];
   const watcher = readJson(path.join(root, 'pr-watch.json'), null);
   if (watcher?.pid) killTree(watcher.pid);

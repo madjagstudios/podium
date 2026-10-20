@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Writable } from 'node:stream';
 import { createJob, updateJob, readJob } from '../engine/store.js';
-import { claimDelivery, releaseDelivery, refreshDelivery } from '../engine/delivery.js';
+import { claimDelivery, releaseDelivery, refreshDelivery, OTHER_CHATS_MS } from '../engine/delivery.js';
 import { markDelivered } from '../engine/outcome.js';
 import { main } from '../engine/cli.js';
 import { tempRoot } from './helpers.js';
@@ -25,6 +25,31 @@ test('the dispatching session can claim at once; others wait two minutes', () =>
   assert.deepEqual(claimDelivery(late.root, late.id, 'B', { now: T }), { claimed: true });
   const noOrigin = finished(null);
   assert.deepEqual(claimDelivery(noOrigin.root, noOrigin.id, 'B', { now: T }), { claimed: true });
+});
+
+// A backlog of notices nobody claimed (their chats closed, or couldn't see them) must not arrive in the next chat
+// that looks, one turn each: past the hour, a notice is its own chat's alone.
+test('another chat takes a notice only within the hour; its own chat takes it at any age', () => {
+  const DAY = 86_400_000;
+  const old = finished({ session: 'A' }, DAY);
+  assert.deepEqual(claimDelivery(old.root, old.id, 'B', { now: T }), { claimed: false, reason: 'too-old' });
+  assert.equal(fs.existsSync(path.join(old.dir, 'delivery.lock')), false, 'a refusal takes no lock');
+  assert.equal(readJob(old.dir).delivered, false, 'it stays undelivered for its own chat');
+  assert.deepEqual(claimDelivery(old.root, old.id, 'A', { now: T }), { claimed: true });
+  // Fresh, as before: its own chat first, then any chat of the project.
+  const fresh = finished({ session: 'A' }, 10 * 60_000);
+  assert.deepEqual(claimDelivery(fresh.root, fresh.id, 'B', { now: T }), { claimed: true });
+  const edge = finished({ session: 'A' }, OTHER_CHATS_MS);
+  assert.deepEqual(claimDelivery(edge.root, edge.id, 'B', { now: T }), { claimed: true });
+  const past = finished({ session: 'A' }, OTHER_CHATS_MS + 1000);
+  assert.deepEqual(claimDelivery(past.root, past.id, 'B', { now: T }), { claimed: false, reason: 'too-old' });
+  // A job started outside any chat is every chat's other.
+  const orphan = finished(null, DAY);
+  assert.deepEqual(claimDelivery(orphan.root, orphan.id, 'B', { now: T }), { claimed: false, reason: 'too-old' });
+  // A PR that opened just now on day-old work is news again, timed from the event.
+  const pr = finished({ session: 'A' }, DAY);
+  updateJob(pr.root, pr.dir, { status: 'in-review', notifiedAt: new Date(T - 10 * 60_000).toISOString() });
+  assert.deepEqual(claimDelivery(pr.root, pr.id, 'B', { now: T }), { claimed: true });
 });
 
 test('a live claim blocks others; a stale one does not; release and delivery clear it', () => {
@@ -80,7 +105,8 @@ test('a lock its holder refreshes is not taken; one it stops refreshing is', () 
 });
 
 test('claim --refresh keeps the holder\'s lock fresh from the CLI', async () => {
-  const { root, id } = finished(null);
+  // The CLI claims at the real time, long after T: the job's own chat may claim it at any age.
+  const { root, id } = finished({ session: 'A' });
   const cli = async (argv) => {
     let out = '';
     const stdout = new Writable({ write(c, _e, cb) { out += c; cb(); } });

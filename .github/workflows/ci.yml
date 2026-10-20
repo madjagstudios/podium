@@ -4,18 +4,101 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, edited]
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Collect optional test profiles
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number && (github.event.action == 'edited' && (toJSON(github.event.changes) == toJSON(fromJSON(format('{{"title":{{"from":{0}}}}}', toJSON(github.event.changes.title.from)))) || toJSON(github.event.changes) == toJSON(fromJSON(format('{{"body":{{"from":{0}}}}}', toJSON(github.event.changes.body.from)))) || toJSON(github.event.changes) == toJSON(fromJSON(format('{{"title":{{"from":{0}}},"body":{{"from":{1}}}}}', toJSON(github.event.changes.title.from), toJSON(github.event.changes.body.from)))) || toJSON(github.event.changes) == toJSON(fromJSON(format('{{"body":{{"from":{0}}},"title":{{"from":{1}}}}}', toJSON(github.event.changes.body.from), toJSON(github.event.changes.title.from))))) && format('metadata-{0}', github.event.pull_request.number) || format('pr-{0}', github.event.pull_request.number)) || format('{0}-{1}-{2}', github.event_name, github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  plan:
+    name: ${{ github.event.action == 'edited' && (toJSON(github.event.changes) == toJSON(fromJSON(format('{{"title":{{"from":{0}}}}}', toJSON(github.event.changes.title.from)))) || toJSON(github.event.changes) == toJSON(fromJSON(format('{{"body":{{"from":{0}}}}}', toJSON(github.event.changes.body.from)))) || toJSON(github.event.changes) == toJSON(fromJSON(format('{{"title":{{"from":{0}}},"body":{{"from":{1}}}}}', toJSON(github.event.changes.title.from), toJSON(github.event.changes.body.from)))) || toJSON(github.event.changes) == toJSON(fromJSON(format('{{"body":{{"from":{0}}},"title":{{"from":{1}}}}}', toJSON(github.event.changes.body.from), toJSON(github.event.changes.title.from))))) && 'metadata-plan' || (github.event_name == 'pull_request' && github.event.pull_request.draft == true && github.event.action != 'edited') && 'deferred-plan' || 'validation-plan' }}
+    runs-on: ubuntu-latest
+    outputs:
+      full: ${{ steps.policy.outputs.full }}
+      kind: ${{ steps.policy.outputs.kind }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Skip large archived logs; tests never read them.
+          sparse-checkout: |
+            /*
+            !/docs/**/*.tar.gz
+            !/docs/**/*.log.gz
+          sparse-checkout-cone-mode: false
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - id: policy
+        run: node scripts/ci-policy.js
   test:
+    needs: plan
+    if: needs.plan.outputs.full == 'true'
     strategy:
       fail-fast: false
       matrix:
         # The OSes differ where Podium works (paths, .cmd shims, process kills); one Node, the floor.
         os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      PROFILE_TESTS: ${{ github.event_name == 'workflow_dispatch' && inputs.profile }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Skip large archived logs; tests never read them.
+          sparse-checkout: |
+            /*
+            !/docs/**/*.tar.gz
+            !/docs/**/*.log.gz
+          sparse-checkout-cone-mode: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - run: git config --global user.name ci && git config --global user.email ci@example.com
       - run: npm test
+        env:
+          PODIUM_TEST_PROFILE_DIR: ${{ env.PROFILE_TESTS == 'true' && format('{0}/test-profile', runner.temp) || '' }}
+      - name: Summarize test profile
+        if: ${{ !cancelled() && env.PROFILE_TESTS == 'true' }}
+        continue-on-error: true
+        run: node scripts/profile-summary.js "${{ runner.temp }}/test-profile" > "${{ runner.temp }}/test-profile/summary.json"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() && env.PROFILE_TESTS == 'true' }}
+        continue-on-error: true
+        with:
+          name: test-profile-${{ matrix.os }}
+          path: ${{ runner.temp }}/test-profile
+          retention-days: 14
+  ci-result:
+    name: ${{ github.event.action == 'edited' && (toJSON(github.event.changes) == toJSON(fromJSON(format('{{"title":{{"from":{0}}}}}', toJSON(github.event.changes.title.from)))) || toJSON(github.event.changes) == toJSON(fromJSON(format('{{"body":{{"from":{0}}}}}', toJSON(github.event.changes.body.from)))) || toJSON(github.event.changes) == toJSON(fromJSON(format('{{"title":{{"from":{0}}},"body":{{"from":{1}}}}}', toJSON(github.event.changes.title.from), toJSON(github.event.changes.body.from)))) || toJSON(github.event.changes) == toJSON(fromJSON(format('{{"body":{{"from":{0}}},"title":{{"from":{1}}}}}', toJSON(github.event.changes.body.from), toJSON(github.event.changes.title.from))))) && 'metadata-result' || (github.event_name == 'pull_request' && github.event.pull_request.draft == true && github.event.action != 'edited') && 'deferred-result' || 'ci-result' }}
+    if: always()
+    needs: [plan, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Skip large archived logs; tests never read them.
+          sparse-checkout: |
+            /*
+            !/docs/**/*.tar.gz
+            !/docs/**/*.log.gz
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/ci-policy.js result
+        env:
+          PLAN_RESULT: ${{ needs.plan.result }}
+          KIND: ${{ needs.plan.outputs.kind }}
+          EXPECTED_KIND: ${{ github.event.action == 'edited' && (toJSON(github.event.changes) == toJSON(fromJSON(format('{{"title":{{"from":{0}}}}}', toJSON(github.event.changes.title.from)))) || toJSON(github.event.changes) == toJSON(fromJSON(format('{{"body":{{"from":{0}}}}}', toJSON(github.event.changes.body.from)))) || toJSON(github.event.changes) == toJSON(fromJSON(format('{{"title":{{"from":{0}}},"body":{{"from":{1}}}}}', toJSON(github.event.changes.title.from), toJSON(github.event.changes.body.from)))) || toJSON(github.event.changes) == toJSON(fromJSON(format('{{"body":{{"from":{0}}},"title":{{"from":{1}}}}}', toJSON(github.event.changes.body.from), toJSON(github.event.changes.title.from))))) && 'metadata' || (github.event_name == 'pull_request' && github.event.pull_request.draft == true && github.event.action != 'edited') && 'deferred' || 'validation' }}
+          FULL: ${{ needs.plan.outputs.full }}
+          TEST_RESULT: ${{ needs.test.result }}

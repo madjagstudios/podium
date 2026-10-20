@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { dataDir, projectKey } from './paths.js';
+import { dataDir, projectKey, projectHere } from './paths.js';
 import { PodiumError } from './errors.js';
 import { listAgents } from './discover.js';
 import { preflight, dispatch } from './dispatch.js';
@@ -11,14 +11,15 @@ import { markDelivered, setOutcome } from './outcome.js';
 import { claimDelivery, releaseDelivery, refreshDelivery } from './delivery.js';
 import { repairMuseSandbox } from './repair.js';
 import { prune } from './retention.js';
-import { loadSettings, setSetting } from './settings.js';
+import { loadSettings, setSetting, repoSettings } from './settings.js';
 import { getAdapter, saveAdapter } from './adapters/registry.js';
 import { doctor, markWelcomed, versionInfo, markSeen } from './doctor.js';
 import { removalPlan, uninstall } from './uninstall.js';
 import { openPr, pushPr, refreshPr, mergePr, setAutoMerge, watchAgain, postReview, fixPrompt, browsePr, flushSprintNews } from './pr.js';
 import { ensureWatch } from './pr-watch.js';
 import { suggestAdapter, testAdapter } from './adapters/admin.js';
-import { draftSprint, startSprint, discardSprint, sprintSummaries, sprintSummary, PANE_FINISHED, setPaused, retryTicket, stopTicket, assignTask, moveTicket, removeTicket, assignTicket, setAfter, setSprintOptions, claimMessages, markMessages, archiveEnded, approvePlan, revisePlan, draftNotes, adoptSprint } from './sprint.js';
+import { draftSprint, startSprint, discardSprint, sprintSummaries, sprintSummary, PANE_FINISHED, setPaused, retryTicket, addNote, acceptTests, reviewWithEvidence, stopTicket, syncTicket, answerCommits, assignTask, moveTicket, removeTicket, assignTicket, setAfter, setSprintOptions, claimMessages, markMessages, refreshMessages, archiveEnded, approvePlan, revisePlan, draftNotes, adoptSprint } from './sprint.js';
+import { repoCiNotes } from './ci-steps.js';
 import { ensureSprints } from './sprint-run.js';
 
 const COMMANDS = 'agents, preflight, dispatch, status, result, cancel, keep, discard, claim, release, deliver, outcome, summary, changes, prune, settings, adapter, repair, doctor, welcome, version, uninstall, here, pr, sprint, data-dir';
@@ -72,7 +73,7 @@ export async function main(argv, { stdout = process.stdout, stdin = process.stdi
       case 'preflight': out = await preflight(root, { agent: need('agent'), permission: opts.permission, model: opts.model, cwd: opts.cwd ?? cwd }); break;
       case 'dispatch': out = await dispatch(root, { agent: need('agent'), permission: opts.permission, model: opts.model ?? null, ticket: opts.ticket ?? null, cwd: opts.cwd ?? cwd, prompt: await prompt(), includeUncommitted: opts['include-uncommitted'] === true, base: opts.base ?? null, session: opts.session ?? null, followUp: opts['follow-up'] ?? null, review: opts.pr ?? null, env }); break;
       case 'status': {
-        const project = opts.here === true ? projectKey(opts.cwd ?? cwd) : opts.project;
+        const project = opts.here === true ? projectHere(opts.cwd ?? cwd) : opts.project;
         out = { jobs: status(root, { project, ticket: opts.ticket, id: opts.id }) };
         // The pane draws sprints from the same call.
         if (opts.here === true) {
@@ -147,8 +148,14 @@ export async function main(argv, { stdout = process.stdout, stdin = process.stdi
           // A new sprint is always a draft: nothing runs until Start.
           const input = JSON.parse(await readAll(stdin));
           const made = await draftSprint(root, input, { cwd: opts.cwd ?? cwd, session: opts.session ?? null });
+          const settings = loadSettings(root);
+          // The check that will apply: the draft's proposal when it makes one (an empty one removes the
+          // check, so there is nothing to cover), else the repo's saved check.
+          const proposedCheck = made.proposed?.check;
+          const check = proposedCheck !== undefined ? (proposedCheck || null) : repoSettings(settings, made.project).check;
+          const ci = await repoCiNotes(made.repo, settings, made.project, { env, check }).catch(() => []);
           // What the draft proposed for the repo: saved only when the person presses Start.
-          out = { ...one(made), notes: draftNotes(made, loadSettings(root)), proposed: made.proposed ?? {} };
+          out = { ...one(made), notes: [...draftNotes(made, settings), ...ci], proposed: made.proposed ?? {} };
         } else if (sub === 'start') {
           const started = await startSprint(root, need('id'));
           // What Start saved for the repo from the draft's proposal, so the reply can say so.
@@ -157,7 +164,7 @@ export async function main(argv, { stdout = process.stdout, stdin = process.stdi
         } else if (sub === 'discard') {
           out = one(await discardSprint(root, need('id')));
         } else if (sub === 'status') {
-          const project = opts.here === true ? projectKey(opts.cwd ?? cwd) : undefined;
+          const project = opts.here === true ? projectHere(opts.cwd ?? cwd) : undefined;
           // One sprint asked for by id is shown even when archived.
           out = { sprints: sprintSummaries(root, { project, includeArchived: Boolean(opts.id), id: opts.id === undefined ? null : need('id') }) };
           await archiveEnded(root, out.sprints);
@@ -165,7 +172,38 @@ export async function main(argv, { stdout = process.stdout, stdin = process.stdi
           out = one(await setPaused(root, need('id'), sub === 'pause'));
           if (sub === 'resume') keepRunning(root, spawn);
         } else if (sub === 'retry') {
-          out = one(await retryTicket(root, need('id'), need('ticket'), { agent: opts.agent ?? null }));
+          // A note for the ticket's agents comes on stdin (--note -), as a plan's notes do.
+          const note = opts.note === undefined ? null : opts.note === '-' ? await readAll(stdin) : need('note');
+          out = one(await retryTicket(root, need('id'), need('ticket'), { agent: opts.agent ?? null, note }));
+          keepRunning(root, spawn);
+        } else if (sub === 'evidence') {
+          // Review again with evidence: the person's words, on stdin.
+          const text = opts.text === '-' ? await readAll(stdin) : need('text');
+          out = one(await reviewWithEvidence(root, need('id'), need('ticket'), text));
+          keepRunning(root, spawn);
+        } else if (sub === 'accept') {
+          // Accept and continue: the person's reason, on stdin.
+          const text = opts.text === '-' ? await readAll(stdin) : need('text');
+          out = one(await acceptTests(root, need('id'), need('ticket'), text));
+          keepRunning(root, spawn);
+        } else if (sub === 'note') {
+          const text = opts.text === '-' ? await readAll(stdin) : need('text');
+          const s = await addNote(root, need('id'), need('ticket'), text);
+          const t = s.tickets.find((x) => x.key === String(opts.ticket).toUpperCase());
+          // A step running now doesn't see it: the reply says it applies from the next one. A step being started (dispatching,
+          // saved before its job; a runner that died there leaves it) may be running already, so it counts too.
+          out = { ...one(s), noted: { key: t.key, n: t.notes.at(-1).n, running: t.state === 'running' || Boolean(t.dispatching) } };
+        } else if (sub === 'sync') {
+          // The base as the remote has it now, merged into the ticket's copy.
+          const r = await syncTicket(root, need('id'), need('ticket'));
+          out = { ...one(r.sprint), commits: r.commits, saved: r.saved ?? null };
+          keepRunning(root, spawn);
+        } else if (sub === 'commits') {
+          // The answer about commits in a ticket's copy that Podium didn't make: --answer keep or drop.
+          const answer = need('answer');
+          if (!['keep', 'drop'].includes(answer)) throw new PodiumError('bad-value', 'Answer keep or drop.');
+          const r = await answerCommits(root, need('id'), need('ticket'), { keep: answer === 'keep' });
+          out = { ...one(r.sprint), dropped: r.dropped, saved: r.saved ?? null };
           keepRunning(root, spawn);
         } else if (sub === 'stop') {
           out = one(await stopTicket(root, need('id'), need('ticket')));
@@ -192,20 +230,23 @@ export async function main(argv, { stdout = process.stdout, stdin = process.stdi
             keys, add: opts.add === undefined ? null : need('add'), drop: opts.drop === undefined ? null : need('drop'),
           }));
         } else if (sub === 'approve' || sub === 'one-task') {
-          // A plan waiting for the person: its tasks, or the whole plan as one task.
-          out = one(await approvePlan(root, need('id'), need('ticket'), { whole: sub === 'one-task' }));
+          // A plan waiting for the person: its tasks, or the whole plan as one task. --acknowledge: the person agreed to the
+          // production commands it runs.
+          out = one(await approvePlan(root, need('id'), need('ticket'), { whole: sub === 'one-task', acknowledge: opts.acknowledge === true }));
           keepRunning(root, spawn);
         } else if (sub === 'revise') {
           const text = opts.text === '-' ? await readAll(stdin) : need('text');
           out = one(await revisePlan(root, need('id'), need('ticket'), text));
           keepRunning(root, spawn);
         } else if (sub === 'ensure') out = ensureSprints(root, { spawn });
-        else if (sub === 'inbox') out = await claimMessages(root, need('session'), { project: opts.here === true ? projectKey(opts.cwd ?? cwd) : undefined });
+        else if (sub === 'inbox') out = await claimMessages(root, need('session'), { project: opts.here === true ? projectHere(opts.cwd ?? cwd) : undefined, instance: opts.instance === undefined ? null : need('instance') });
         else if (sub === 'delivered') out = await markMessages(root, String(need('ids')).split(','));
+        // A chat still sending claimed news renews its claims.
+        else if (sub === 'refresh') out = refreshMessages(root, need('session'), String(need('ids')).split(','), { instance: opts.instance === undefined ? null : need('instance') });
         // "Take them here": the sprint's news goes to this chat from now on.
         // Only a sprint of the repo it is run in (always checked, whether or not --here was passed).
-        else if (sub === 'adopt') out = one(await adoptSprint(root, need('id'), need('session'), { project: projectKey(opts.cwd ?? cwd) }));
-        else throw new PodiumError('unknown-command', 'Use: podium sprint draft | start | discard | status | pause | resume | retry | stop | assign | move | remove | options | after | approve | one-task | revise | ensure | inbox | delivered | adopt');
+        else if (sub === 'adopt') out = one(await adoptSprint(root, need('id'), need('session'), { project: projectHere(opts.cwd ?? cwd) }));
+        else throw new PodiumError('unknown-command', 'Use: podium sprint draft | start | discard | status | pause | resume | retry | note | accept | evidence | sync | commits | stop | assign | move | remove | options | after | approve | one-task | revise | ensure | inbox | delivered | refresh | adopt');
         break;
       }
       case 'data-dir': out = { dataDir: root }; break;
@@ -214,8 +255,9 @@ export async function main(argv, { stdout = process.stdout, stdin = process.stdi
     stdout.write(JSON.stringify(out) + '\n');
     return 0;
   } catch (e) {
+    // Full Git output is for engine diagnostics; keep the CLI's existing concise error shape.
     const error = e instanceof PodiumError
-      ? { code: e.code, message: e.message, details: e.details ?? null }
+      ? { code: e.code, message: e.message, details: e.code === 'git-failed' ? null : e.details ?? null }
       : { code: 'internal', message: e.message, details: null };
     stdout.write(JSON.stringify({ error }) + '\n');
     return 1;

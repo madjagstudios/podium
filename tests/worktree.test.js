@@ -201,6 +201,21 @@ function fakeChild(pid = 4242) {
   return child;
 }
 
+test('git-failed keeps its existing message and bounded full output details', async () => {
+  const stderr = 'warning: first warning\nwarning: failed to remove held file: Invalid argument\nerror: Could not remove untracked files from working tree\n' + 'x'.repeat(20000);
+  const stdout = 'Saved working directory\n' + 'y'.repeat(20000);
+  await assert.rejects(gitIn('unused', ['fetch', 'origin'], { spawn: () => {
+    const child = fakeChild();
+    setImmediate(() => { child.stdout.end(stdout); child.stderr.end(stderr); child.emit('close', 1, null); });
+    return child;
+  } }), e => {
+    assert.equal(e.code, 'git-failed');
+    assert.equal(e.message, 'git fetch: Could not remove untracked files from working tree');
+    assert.deepEqual(e.details, { stdout: stdout.slice(0, 16384), stderr: stderr.slice(0, 16384) });
+    return true;
+  });
+});
+
 test('network git is spawned leading its own group on macOS and Linux (not on Windows), and its output is read', async () => {
   for (const platform of ['linux', 'darwin', 'win32']) {
     const calls = [];

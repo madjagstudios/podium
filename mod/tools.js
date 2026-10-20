@@ -1,4 +1,4 @@
-import { jobLine, sprintLines, repoValuesText } from './view.js';
+import { jobLine, sprintLines, repoValuesText, syncedText, commitsAnswerText, notedText } from './view.js';
 
 const PERMISSIONS = ['edit-worktree', 'read-only', 'own-config', 'full-access'];
 const byId = { type: 'object', properties: { id: { type: 'string', description: 'The job id' } }, required: ['id'] };
@@ -12,13 +12,13 @@ export const TOOLS = [
       properties: {
         agent: { type: 'string', description: 'Agent name, e.g. codex, muse, claude, gemini' },
         task: { type: 'string', description: 'Complete, self-contained instructions for the agent' },
-        followUp: { type: 'string', description: 'The id of a job to continue: the follow-up runs in that job\'s copy, after its changes, and resumes the agent\'s conversation when the agent is the same.' },
+        followUp: { type: 'string', description: 'The id of a job to continue: the follow-up runs in that job\'s copy, after its changes, and resumes the agent\'s conversation when the agent is the same. Don\'t use with pr: a PR review can\'t be continued; dispatch with pr again.' },
         permission: { type: 'string', enum: PERMISSIONS },
         model: { type: 'string', description: 'Optional model id or alias for that agent' },
         ticket: { type: 'string', description: 'Optional ticket key, e.g. ABC-123' },
         base: { type: 'string', description: 'Optional branch or commit to start the agent\'s copy from (e.g. feat/oc-11-chapter-3) instead of the current checkout. Use it when the work belongs on another branch.' },
         includeUncommitted: { type: 'boolean', description: "Edit jobs only: copy the user's uncommitted changes into the agent's copy" },
-        pr: { type: 'number', description: "Review this pull request number instead of doing new work: a read-only job on the PR's code. Findings come back here; they reach GitHub only when the user asks (pr tool, action post-review). The task may be empty or say what to focus on." },
+        pr: { type: 'number', description: "Review this pull request number instead of doing new work: a read-only job on the PR's code. Findings come back here; they reach GitHub only when the user asks (pr tool, action post-review). The task may be empty or say what to focus on. Don't use with followUp: a PR review can't be continued; dispatch with pr again." },
       },
       required: ['agent', 'task'],
     },
@@ -46,21 +46,22 @@ export const TOOLS = [
     name: 'sprint',
     description: [
       'Plan and run a sprint, only when the user asks for one: several tickets, each worked task by task by agents, with a reviewer agent checking every task, each ticket ending as a PR the user merges.',
-      'Drafting: first read each ticket and its plan if it has one, and propose in the chat a writer and a reviewer for each task (the reviewer should be a different agent from the writer). Then action "draft" (name, tickets; optional base, default main, and mergeWhenGreen) saves it as a draft and opens its board in the Podium pane. A ticket with no plan is planned first by its writer, from its summary, so give it one. Optional commands and check: pass them only when the user has agreed to them in the chat. They are proposed with the draft and shown on its board, and take effect for this repo only when the user presses Start (Discard drops them); the reply says what was proposed. If the reply says the repo has no full check, propose one to the user before Start.',
+      'Drafting: first read each ticket and its plan if it has one, and propose in the chat a writer and a reviewer for each task (the reviewer should be a different agent from the writer). Then action "draft" (name, tickets; optional base, default main, and mergeWhenGreen) saves it as a draft and opens its board in the Podium pane. A ticket with no plan is planned first by its writer, from its summary, so give it one. Optional commands, check, taskTest, planDir and keepPlan: pass them only when the user has agreed to them in the chat. They are proposed with the draft and shown on its board, and take effect for this repo only when the user presses Start (Discard drops them); the reply says what was proposed. If the reply says the repo has no full check, propose one to the user before Start.',
       'Starting: nothing runs yet. Tell the user to look the draft over on its board and press Start, or ask you to start it. "start" (id): start a draft, only when the user asks.',
       'Changes to a draft before Start (id): "move" (ticket, to), "remove" (ticket), "options" (mergeWhenGreen and/or atOnce), "assign" without task (ticket, agent and/or reviewer: for every task of that ticket, or the writer and reviewer of a ticket with no plan), "after" (ticket, after), "discard" (throw the draft away).',
-      'Once it runs: "status": the board. "pause" / "resume" (id). "retry" (id, ticket; optional agent to give the stuck step to). "stop" (id, ticket): end a ticket the user has given up on; its branch is kept, and it cannot be stopped while it is working. "assign" (id, ticket, task, agent and/or reviewer) for a task not yet run (task 0: the writer and reviewer of a ticket whose plan is not approved yet). "adopt" (id): only when the user asks, take a sprint whose own chat is gone into this chat, so its updates waiting for that chat (and all later ones) come here.',
-      'Answering a plan: when a ticket\'s plan is ready you get a message. Sum it up for the user and ask whether to approve it or change it (or, for a plan with no tasks, run it as one task), and act only when the user says so (id, ticket): "approve" makes its tasks the ticket\'s, which then run; "revise" (text: what should change) sends it back to its writer, in the same conversation; "one-task" runs a plan with no tasks as one task.',
+      'Once it runs: "status": the board. "pause" / "resume" (id). "retry" (id, ticket; optional agent to give the stuck step to; optional text: a note from the user for the retried step, added as "note" adds one). "note" (id, ticket, text): a decision or instruction from the user for one ticket (e.g. "the date tests fail on main too: leave them"); every later planner, writer and reviewer of that ticket reads it, and a step already running doesn\'t. Only the user\'s own words, when they ask: never add a note on your own. "accept" (id, ticket, text: why the results are fine, in the user\'s words): for a ticket stopped on its task\'s tests (the writer\'s own run, or the task test on this machine), only when the user says those results are fine (e.g. "the date tests fail on main too"); the task goes on to its review, whose reviewer is told not to fail it for them. "evidence" (id, ticket, text: what the reviewer should weigh, e.g. a CI run that passed on this code): for a ticket stopped after its task failed review, only when the user gives it; the task goes back to that review (not to a fix), whose reviewer weighs it before failing the task for tests it could not run. "stop" (id, ticket): end a ticket the user has given up on; its branch is kept, and it cannot be stopped while it is working. "assign" (id, ticket, task, agent and/or reviewer) for a task not yet run (task 0: the writer and reviewer of a ticket whose plan is not approved yet). "adopt" (id): only when the user asks, take a sprint whose own chat is gone into this chat, so its updates waiting for that chat (and all later ones) come here. "sync" (id, ticket): merge the base as it is now into a ticket\'s copy, between its tasks or after the last one (for a fix that landed on the base after the ticket started); after the last task the full check runs again. Never commit in a ticket\'s copy yourself: when a ticket asks about commits in its copy that Podium didn\'t make, ask the user, then "keep-commits" (they become the ticket\'s) or "drop-commits" (id, ticket).',
+      'Answering a plan: when a ticket\'s plan is ready you get a message. Sum it up for the user and ask whether to approve it or change it (or, for a plan with no tasks, run it as one task), and act only when the user says so (id, ticket): "approve" makes its tasks the ticket\'s, which then run; "revise" (text: what should change) sends it back to its writer, in the same conversation; "one-task" runs a plan with no tasks as one task. A plan whose message says it needs your attention runs production commands (deploys, deletes, publishing, pushes): name each one to the user, and only if they agree to them, approve (or one-task) with acknowledge: true; without it Podium refuses.',
     ].join('\n\n'),
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['draft', 'start', 'discard', 'move', 'remove', 'options', 'status', 'pause', 'resume', 'retry', 'stop', 'assign', 'after', 'approve', 'revise', 'one-task', 'adopt'] },
+        action: { type: 'string', enum: ['draft', 'start', 'discard', 'move', 'remove', 'options', 'status', 'pause', 'resume', 'retry', 'note', 'accept', 'evidence', 'sync', 'keep-commits', 'drop-commits', 'stop', 'assign', 'after', 'approve', 'revise', 'one-task', 'adopt'] },
         id: { type: 'string', description: 'The sprint id' },
         name: { type: 'string' },
         tickets: { type: 'array', items: { type: 'object' }, description: 'Action "draft": each ticket has key, title, type (feat, fix, chore…), plan, agent and reviewer, and optionally tasks, summary and after. plan: the repo path of its plan, e.g. docs/plans/2026-10-06-x.md, whose "### Task N:" sections become the tasks; leave it out for a ticket with no plan. agent and reviewer: the writer and the reviewer for its tasks. tasks: [{ n, agent, reviewer }] per-task overrides. summary: the ticket\'s text exactly as the user or the tracker gave it, never just its title. after: keys of tickets in this sprint that must be merged first; it then starts from the base branch as GitHub has it.' },
         base: { type: 'string' },
         mergeWhenGreen: { type: 'boolean' },
+        acknowledge: { type: 'boolean', description: 'Actions "approve" and "one-task": true only when the user has agreed to the production commands the plan runs' },
         ticket: { type: 'string', description: 'A ticket key in the sprint' },
         task: { type: 'number' },
         agent: { type: 'string' },
@@ -68,9 +69,12 @@ export const TOOLS = [
         to: { type: 'string', enum: ['up', 'down'], description: 'Which way to move a draft ticket' },
         atOnce: { type: 'number', description: 'How many tickets run at the same time, 1 to 5 (default 3)' },
         after: { type: 'array', items: { type: 'string' }, description: 'Action "after": the keys of the tickets this one waits for ([] for none)' },
-        text: { type: 'string', description: 'Action "revise": what should change in the plan, in the user\'s words' },
+        text: { type: 'string', description: 'In the user\'s words. Action "revise": what should change in the plan. Action "note": the note for the ticket\'s agents. Action "retry": optional, a note for the retried step. Action "accept": why the task\'s test results are fine. Action "evidence": what the reviewer should weigh.' },
         commands: { type: 'array', items: { type: 'string' }, description: 'Action "draft": the commands agents may run in this repo while they edit, as plain names (e.g. ["dotnet"]); never a shell.' },
         check: { type: 'string', description: 'Action "draft": the repo\'s full check, run in each ticket\'s copy before its PR opens (e.g. "dotnet build && dotnet test").' },
+        taskTest: { type: 'string', description: 'Action "draft": the repo\'s task test, which Podium runs on this machine in a ticket\'s copy after each writer\'s step; its result, not the writer\'s own run, decides whether the task goes to review (e.g. "dotnet test"). For repos whose tests need what an agent\'s sandbox lacks.' },
+        planDir: { type: 'string', description: 'Action "draft": the folder sprint plans go in, relative to the repo (e.g. "docs/plans").' },
+        keepPlan: { type: 'boolean', description: 'Action "draft": true to keep each ticket\'s plan file in its PR (by default Podium leaves it out; the plan stays in Podium\'s record).' },
       },
       required: ['action'],
     },
@@ -115,10 +119,14 @@ export function engineCall(tool, input) {
         const draft = { name: input.name, tickets: input.tickets };
         if (input.base) draft.base = input.base;
         if (input.mergeWhenGreen === true) draft.mergeWhenGreen = true;
-        // The repo's commands and full check, proposed with the draft. Passed as given, of any type: the engine
-        // refuses a bad one with its plain message rather than the value being dropped here without a word.
+        // The repo's commands, full check, task test, plans folder and whether PRs keep the plan, proposed with the draft.
+        // Passed as given, of any type: the engine refuses a bad one with its plain message rather than the value being
+        // dropped here without a word.
         if (input.commands !== undefined) draft.commands = input.commands;
         if (input.check !== undefined) draft.check = input.check;
+        if (input.taskTest !== undefined) draft.taskTest = input.taskTest;
+        if (input.planDir !== undefined) draft.planDir = input.planDir;
+        if (input.keepPlan !== undefined) draft.keepPlan = input.keepPlan;
         return { args: ['sprint', 'draft', '--json', '-'], stdin: JSON.stringify(draft) };
       }
       if (action === 'start' && !input.id) throw new Error('Say which sprint to start (its id). To make a new sprint, use action "draft".');
@@ -130,10 +138,10 @@ export function engineCall(tool, input) {
         if (!input.id) throw new Error('Say which sprint to take into this chat (its id).');
         return { args: ['sprint', 'adopt', ...id, '--here'] };
       }
-      if (['retry', 'assign', 'stop', 'move', 'remove', 'after', 'approve', 'revise', 'one-task'].includes(action) && !input.ticket) throw new Error('Say which ticket.');
+      if (['retry', 'note', 'accept', 'evidence', 'sync', 'keep-commits', 'drop-commits', 'assign', 'stop', 'move', 'remove', 'after', 'approve', 'revise', 'one-task'].includes(action) && !input.ticket) throw new Error('Say which ticket.');
       const ticket = ['--ticket', String(input.ticket)];
       // A plan waiting for the user.
-      if (action === 'approve' || action === 'one-task') return { args: ['sprint', action, ...id, ...ticket] };
+      if (action === 'approve' || action === 'one-task') return { args: ['sprint', action, ...id, ...ticket, ...(input.acknowledge === true ? ['--acknowledge'] : [])] };
       if (action === 'revise') {
         const text = String(input.text ?? '').trim();
         if (!text) throw new Error('Say what should change in the plan (text).');
@@ -148,7 +156,29 @@ export function engineCall(tool, input) {
         return { args: ['sprint', 'after', ...id, ...ticket, '--keys', keys.length ? keys.join(',') : 'none'] };
       }
       if (action === 'stop') return { args: ['sprint', 'stop', ...id, ...ticket] };
-      if (action === 'retry') return { args: ['sprint', 'retry', ...id, ...ticket, ...(input.agent ? ['--agent', String(input.agent)] : [])] };
+      if (action === 'sync') return { args: ['sprint', 'sync', ...id, ...ticket] };
+      if (action === 'keep-commits' || action === 'drop-commits') return { args: ['sprint', 'commits', ...id, ...ticket, '--answer', action === 'keep-commits' ? 'keep' : 'drop'] };
+      if (action === 'note') {
+        const text = String(input.text ?? '').trim();
+        if (!text) throw new Error('Say what the note is (text).');
+        return { args: ['sprint', 'note', ...id, ...ticket, '--text', '-'], stdin: text };
+      }
+      if (action === 'evidence') {
+        const text = String(input.text ?? '').trim();
+        if (!text) throw new Error('Say what the reviewer should weigh (text).');
+        return { args: ['sprint', 'evidence', ...id, ...ticket, '--text', '-'], stdin: text };
+      }
+      if (action === 'accept') {
+        const text = String(input.text ?? '').trim();
+        if (!text) throw new Error('Say why the test results are fine (text).');
+        return { args: ['sprint', 'accept', ...id, ...ticket, '--text', '-'], stdin: text };
+      }
+      if (action === 'retry') {
+        // A note goes by stdin, like any text the user wrote.
+        const note = String(input.text ?? '').trim();
+        const args = ['sprint', 'retry', ...id, ...ticket, ...(input.agent ? ['--agent', String(input.agent)] : [])];
+        return note ? { args: [...args, '--note', '-'], stdin: note } : { args };
+      }
       if (action === 'move') {
         if (input.to !== 'up' && input.to !== 'down') throw new Error('Say which way to move it: up or down.');
         return { args: ['sprint', 'move', ...id, ...ticket, '--to', input.to] };
@@ -224,7 +254,13 @@ export function formatToolResult(tool, r, input = {}) {
         proposed ? `\n\nProposed for this repo: ${proposed}. Nothing is saved yet: these take effect for the repo when the person presses Start (Discard drops them). They are shown on the draft's board.` : '',
         applied ? `\n\nSaved for this repo at Start: ${applied}.` : '',
       ].join('');
-      return `Sprint ${v.sprint.id}:\n${sprintLines(v.sprint).join('\n')}${note}${notes}${repo}`;
+      // What Sync with base brought in, or what Keep or Drop did with commits Podium didn't make.
+      const done = [
+        typeof v.commits === 'number' && input.ticket ? `\n\n${syncedText(String(input.ticket).toUpperCase(), v.sprint.base, v.commits, v.saved)}` : '',
+        Array.isArray(v.dropped) && input.ticket ? `\n\n${commitsAnswerText(String(input.ticket).toUpperCase(), input.action === 'keep-commits', v.dropped, v.saved)}` : '',
+        v.noted ? `\n\n${notedText(v.noted.key, v.noted.running)}` : '',
+      ].join('');
+      return `Sprint ${v.sprint.id}:\n${sprintLines(v.sprint).join('\n')}${note}${notes}${repo}${done}`;
     }
     // A sprint Podium could not read just now (busy) is left out; the next ask shows it.
     const list = (v.sprints ?? []).filter((s) => !s.busy);

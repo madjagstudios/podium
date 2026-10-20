@@ -11,13 +11,13 @@
 // stops its own check (its process group) and records it as timed out (stopped). A runner that is dead or not beating
 // reads no request and nothing is killed: that check is lost and left alone.
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { spawnDetachedNode, ownGroup, killGroup } from './launch.js';
-import { isAlive } from './status.js';
+import { isAlive, bootTime, setBootTime } from './status.js';
 import { readJson, writeJsonAtomic } from './fsutil.js';
+import { copyBuildEnv } from './build-env.js';
 
 const RUN_CHECK = fileURLToPath(new URL('./run-check.js', import.meta.url));
 const RECORD = 'check.json';
@@ -37,6 +37,19 @@ export const STALE_MS = 45_000;
 
 const recordOf = (dir) => readJson(path.join(dir, RECORD), null);
 const write = (dir, patch) => writeJsonAtomic(path.join(dir, RECORD), { ...recordOf(dir), ...patch });
+// For the readers below, which never throw: null when there is no record, undefined when there is one that can't be read
+// (spoiled, or no permission). Such a run reads as lost (checkState), and never as settled (checkSettled): nothing proves
+// its runner stopped writing.
+function readRecord(dir) {
+  if (!dir) return null;
+  try {
+    return recordOf(dir);
+  } catch {
+    return undefined;
+  }
+}
+// The command line a run's record says it ran, or null.
+export const checkCommand = (dir) => readRecord(dir)?.command ?? null;
 
 // Only the end of the log is read: a check may print a great deal. Up to 4 bytes a character, so LOG_TAIL characters fit.
 function logTail(dir) {
@@ -55,13 +68,9 @@ function logTail(dir) {
   }
 }
 
-// When this machine last started. A pid recorded before then may belong to anything now. (With Windows Fast Startup a
-// shutdown does not reset it: the heartbeat is what proves a runner is still the one Podium started.)
-// Tests only: a fixed boot time (setBootTime), so a test can backdate a check on a machine that started minutes ago (a
-// fresh CI runner) without it reading as "recorded before the machine started".
-let bootOverride = null;
-export function setBootTime(at = null) { bootOverride = at; }
-export const bootTime = () => bootOverride ?? Date.now() - os.uptime() * 1000;
+// When this machine last started (bootTime, in status.js). With Windows Fast Startup a shutdown does not reset it: the
+// heartbeat is what proves a runner is still the one Podium started.
+export { setBootTime, bootTime };
 
 // The record first, then the detached runner, which adds its pid and heartbeat and, at the end, the result. beatMs is a
 // test seam.
@@ -74,8 +83,11 @@ export function startCheck(dir, { command, cwd, limitMs, now = Date.now(), beatM
 // Run by run-check.js: the command through the shell, in the copy, its output to check.log, stopped (with everything it
 // started) at its time limit or on a stop request. A beat that can't be written is skipped, so the time limit always
 // holds. The result is written, or tried once more; if that fails too the log says so and it returns false, and Podium
-// reads the check as lost. writeRecord and retryMs are test seams.
-export async function runCheck(dir, { writeRecord = write, retryMs = 500 } = {}) {
+// reads the check as lost. Where the system refuses to stop the check's whole tree (a sandbox may), the runner stops its
+// check's shell through its own handle and the log says what the check started may still be running: the runner ends
+// and records the stop either way, and never waits for ever on a check it could not stop. writeRecord, retryMs and
+// stopTree are test seams.
+export async function runCheck(dir, { writeRecord = write, retryMs = 500, stopTree = killGroup } = {}) {
   const rec = recordOf(dir);
   writeRecord(dir, { runnerPid: process.pid, beatAt: new Date().toISOString() });
   let askedToStop = () => {};
@@ -93,7 +105,7 @@ export async function runCheck(dir, { writeRecord = write, retryMs = 500 } = {})
   const code = await new Promise((resolve) => {
     let child;
     try {
-      child = spawn(rec.command, { cwd: rec.cwd, shell: true, stdio: ['ignore', out, out], windowsHide: true, ...ownGroup() });
+      child = spawn(rec.command, { cwd: rec.cwd, env: copyBuildEnv(), shell: true, stdio: ['ignore', out, out], windowsHide: true, ...ownGroup() });
     } catch (e) {
       fs.appendFileSync(logFile, `\n${e.message}\n`);
       resolve(-1);
@@ -102,7 +114,11 @@ export async function runCheck(dir, { writeRecord = write, retryMs = 500 } = {})
     // The check's pid is only informational: a failed write must not leave the check without its limit.
     try { writeRecord(dir, { checkPid: child.pid ?? null }); } catch { /* not needed */ }
     let killed = false;
-    const stop = () => { if (killed) return; killed = true; timedOut = true; killGroup(child.pid); };
+    const refused = (pid, said) => {
+      child.kill();
+      try { fs.appendFileSync(logFile, `\nPodium couldn't stop everything the check started (${said}). It stopped the check's shell; what that started may still be running.\n`); } catch { /* the stop stands */ }
+    };
+    const stop = () => { if (killed) return; killed = true; timedOut = true; stopTree(child.pid, { refused }); };
     const timer = setTimeout(stop, rec.limitMs);
     askedToStop = () => { stopped = true; stop(); };
     asked();
@@ -140,8 +156,8 @@ function runnerBeating(rec, now, bootAt) {
 // How the check stands, with the end of its log. Only reads: the pane and the tool ask too, without the sprint's lock.
 // A runner still beating far past the limit reads as timed out and overdue, for the tick to stop.
 export function checkState(dir, { now = Date.now(), bootAt = bootTime() } = {}) {
-  const rec = dir ? recordOf(dir) : null;
-  if (!rec) return { state: 'lost', log: '' };
+  const rec = readRecord(dir);
+  if (!rec) return { state: 'lost', log: rec === undefined ? logTail(dir) : '' };
   if (rec.endedAt) {
     if (rec.timedOut) return { state: 'timed-out', log: logTail(dir) };
     return rec.exitCode === 0 ? { state: 'passed', log: '' } : { state: 'failed', exitCode: rec.exitCode, log: logTail(dir) };
@@ -155,18 +171,33 @@ export function checkState(dir, { now = Date.now(), bootAt = bootTime() } = {}) 
     : !(started >= bootAt) || !isAlive(rec.runnerPid) || (overdue && !runnerBeating(rec, now, bootAt));
   if (gone) {
     // Its result may have landed since the record was read.
-    return recordOf(dir)?.endedAt ? checkState(dir, { now, bootAt }) : { state: 'lost', log: logTail(dir) };
+    return readRecord(dir)?.endedAt ? checkState(dir, { now, bootAt }) : { state: 'lost', log: logTail(dir) };
   }
   if (overdue) return { state: 'timed-out', overdue: true, log: logTail(dir) };
   return { state: 'running' };
 }
 
-export const checkRunning = (dir) => Boolean(dir) && checkState(dir).state === 'running';
+// Whether nothing of a run can still be writing in its folder: its end is recorded, its runner never started, or its runner
+// and its check are both gone (dead, or recorded before this machine started). A runner alive but silent may still write
+// (a lost run is not a settled one). A reused pid only keeps a run unsettled, never the other way.
+// A record that can't be read says none of that: its run is settled only if its file has not changed since before this
+// machine started. Its age alone proves nothing (a hung runner's check may still be going), so its copy stays, as a hung
+// runner's does.
+export function checkSettled(dir, { now = Date.now(), bootAt = bootTime() } = {}) {
+  const rec = readRecord(dir);
+  if (rec === undefined) {
+    try { return fs.statSync(path.join(dir, RECORD)).mtimeMs < bootAt; } catch { return false; }
+  }
+  if (!rec || rec.endedAt) return true;
+  if (!rec.runnerPid) return now - Date.parse(rec.startedAt) > LATE_MS;
+  if (!(Date.parse(rec.startedAt) >= bootAt)) return true;
+  return !isAlive(rec.runnerPid) && !(rec.checkPid && isAlive(rec.checkPid));
+}
 
 // Ask an overdue check's beating runner to stop it (see the header). Only the tick calls it, under the sprint lock;
 // returns whether the request was written.
 export function stopCheck(dir, { now = Date.now(), bootAt = bootTime() } = {}) {
-  const rec = dir ? recordOf(dir) : null;
+  const rec = readRecord(dir);
   if (!rec || rec.endedAt || !runnerBeating(rec, now, bootAt)) return false;
   try {
     fs.writeFileSync(path.join(dir, STOP), new Date(now).toISOString());

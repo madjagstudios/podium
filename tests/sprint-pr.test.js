@@ -3,17 +3,18 @@ import test from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
 import assert from 'node:assert/strict';
-import { createSprint, tick, retryTicket, loadSprint, saveSprint, locked } from '../engine/sprint.js';
+import { createSprint, tick, retryTicket, loadSprint, saveSprint, locked, sprintSummary } from '../engine/sprint.js';
+import { refreshPr } from '../engine/pr.js';
 import { listJobDirs, readJob, updateJob } from '../engine/store.js';
 import { setSetting } from '../engine/settings.js';
 import { projectKey } from '../engine/paths.js';
-import { waitFor, scriptAgent, sprintWorld, tempRoot, tempRepo } from './helpers.js';
+import { waitFor, scriptAgent, sprintWorld, tempRoot, tempRepo, PLAN } from './helpers.js';
 
 const T = (over = {}) => ({ key: 'ABC-11', title: 'Login form', type: 'feat', plan: 'docs/plan.md', agent: 'fa', reviewer: 'fr', summary: 'People sign in with their email.', ...over });
 const run = (root, id, env, until) => waitFor(async () => { const s = await tick(root, id, { env }); return until(s) ? s : null; }, { timeoutMs: 90_000, intervalMs: 150 });
 const created = (w) => w.calls().find((c) => c[0] === 'pr' && c[1] === 'create');
 const copyOf = (root, s) => readJob(listJobDirs(root).find((d) => d.endsWith(s.tickets[0].latest))).worktree;
-const BODY = 'People sign in with their email.\n\nChanges:\n- Add a.txt\n- Add b.txt';
+const BODY = 'Changes:\n- Add a.txt\n- Add b.txt\n\nTested: each task ran its own tests before review.';
 
 function world() {
   const { root, w } = sprintWorld();
@@ -22,14 +23,15 @@ function world() {
   return { root, w };
 }
 
-test('a sprint PR\'s body is the ticket\'s text and task titles, with no steps section, agent names or step numbers added', async () => {
+test('a sprint PR\'s body is composed from the plan, never the ticket\'s text, with no agent names or step numbers', async () => {
   const { root, w } = world();
-  const s0 = await createSprint(root, { name: 'x', tickets: [T()] }, { cwd: w.repo });
-  await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'pr-open');
+  const s0 = await createSprint(root, { name: 'x', tickets: [T({ summary: 'Port it from Nightjar, as the implementation brief says (build 9f3c2e1).' })] }, { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'pr-open');
   const create = created(w);
   const body = create[create.indexOf('--body-text') + 1];
   assert.equal(body, BODY);
-  for (const bad of [/## Steps/, /\bcodex\b|\bclaude\b/i, /\b(Task|Step|Phase)\s+\d+\b/]) assert.doesNotMatch(body, bad);
+  for (const bad of [/Nightjar|brief|9f3c2e1/, /## Steps/, /\bcodex\b|\bclaude\b/i, /\b(Task|Step|Phase)\s+\d+\b/]) assert.doesNotMatch(body, bad);
+  assert.equal(w.git(copyOf(root, s), 'log', '-1', '--format=%b'), BODY);
 });
 
 test('a ticket titled with quotes reaches its PR, with a title Windows can pass', async () => {
@@ -201,15 +203,13 @@ test('a recorded push of another branch is not a lease for this one', async () =
   assert.equal(w.git(w.remote, 'rev-parse', BRANCH), before, 'the remote branch is untouched');
 });
 
-test('the squashed commit\'s message is the PR body exactly, with no whitespace tidying', async () => {
+test('the squashed commit\'s message is the PR body exactly', async () => {
   const { root, w } = world();
-  const summary = 'First line  \n\n\n\nSecond line';
-  const s0 = await createSprint(root, { name: 'x', tickets: [T({ summary })] }, { cwd: w.repo });
+  const s0 = await createSprint(root, { name: 'x', tickets: [T({ summary: 'First line  \n\n\n\nSecond line' })] }, { cwd: w.repo });
   const s = await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'pr-open');
-  const body = `${summary}\n\nChanges:\n- Add a.txt\n- Add b.txt`;
-  assert.equal(w.git(copyOf(root, s), 'log', '-1', '--format=%B'), `ABC-11: Login form\n\n${body}`);
+  assert.equal(w.git(copyOf(root, s), 'log', '-1', '--format=%B'), `ABC-11: Login form\n\n${BODY}`);
   const create = created(w);
-  assert.equal(create[create.indexOf('--body-text') + 1], body);
+  assert.equal(create[create.indexOf('--body-text') + 1], BODY);
 });
 
 test('a ticket whose copy is gone is parked with a plain reason, and no git command runs outside a copy', async () => {
@@ -236,4 +236,131 @@ test('a ticket whose copy is gone is parked with a plain reason, and no git comm
   }
   assert.deepEqual(state(stray), strayBefore, 'the process\'s own folder is unchanged and nothing in it is staged');
   assert.deepEqual(state(w.repo), mineBefore, 'so is the person\'s');
+});
+
+// The default plan with a PR summary section after its tasks.
+const SUMMARY_PLAN = (summary) => PLAN.replace('## Done\n', `## PR summary\n${summary}\n\n## Done\n`);
+const summaryWorld = (summary, gh = []) => {
+  const { root, w } = sprintWorld({ plans: { 'docs/plan.md': SUMMARY_PLAN(summary) }, gh });
+  scriptAgent(root, 'fa', [{ write: 'a.txt', say: 'did a' }, { write: 'b.txt', say: 'did b' }]);
+  scriptAgent(root, 'fr', [{ say: 'VERDICT: pass' }, { say: 'VERDICT: pass' }]);
+  return { root, w };
+};
+const bodyOf = (w) => { const c = created(w); return c[c.indexOf('--body-text') + 1]; };
+
+test('the plan\'s PR summary leads the body, and the tested line says the repo\'s check passed, without its command', async () => {
+  const { root, w } = summaryWorld('People can sign in\nwith their email.');
+  setSetting(root, 'repoCheck', { [projectKey(w.repo)]: 'node -e "process.exit(0)"' });
+  const s0 = await createSprint(root, { name: 'x', tickets: [T()] }, { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, (x) => ['pr-open', 'parked'].includes(x.tickets[0].state));
+  assert.equal(s.tickets[0].state, 'pr-open', s.tickets[0].reason);
+  const body = 'People can sign in with their email.\n\nChanges:\n- Add a.txt\n- Add b.txt\n\nTested: the repo\'s full check passed on the final change.';
+  assert.equal(bodyOf(w), body);
+  assert.equal(w.git(copyOf(root, s), 'log', '-1', '--format=%b'), body);
+});
+
+test('in a public repo, lines naming an agent, another project\'s ticket or a private term are left out, and the news says so', async () => {
+  const { root, w } = summaryWorld('Ports the codex parser from Nightjar, as XYZ-7 asked.');
+  const project = projectKey(w.repo);
+  setSetting(root, 'repoPublic', { [project]: true });
+  setSetting(root, 'repoPrivateTerms', { [project]: ['Nightjar'] });
+  const s0 = await createSprint(root, { name: 'x', tickets: [T()] }, { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'pr-open');
+  assert.equal(bodyOf(w), BODY);
+  assert.ok(s.messages.some((m) => m.text === 'ABC-11: Login form (PR #12) is open. https://github.com/o/r/pull/12 Left out of its text, since the repo is public: XYZ-7, codex, Nightjar.'), JSON.stringify(s.messages));
+});
+
+test('in a public repo, a title with a private term becomes the ticket key alone, in the PR and its commit', async () => {
+  const { root, w } = world();
+  const project = projectKey(w.repo);
+  setSetting(root, 'repoPublic', { [project]: true });
+  setSetting(root, 'repoPrivateTerms', { [project]: ['Nightjar'] });
+  const s0 = await createSprint(root, { name: 'x', tickets: [T({ title: 'Nightjar login' })] }, { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'pr-open');
+  const create = created(w);
+  assert.equal(create[create.indexOf('--title') + 1], 'ABC-11');
+  assert.deepEqual(w.git(copyOf(root, s), 'log', 'main..HEAD', '--format=%s').split('\n'), ['ABC-11']);
+});
+
+test('a repo marked private keeps its PR text as composed', async () => {
+  const { root, w } = summaryWorld('Ports the codex parser, as XYZ-7 asked.');
+  setSetting(root, 'repoPublic', { [projectKey(w.repo)]: false });
+  const s0 = await createSprint(root, { name: 'x', tickets: [T()] }, { cwd: w.repo });
+  await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'pr-open');
+  assert.equal(bodyOf(w), `Ports the codex parser, as XYZ-7 asked.\n\n${BODY}`);
+  assert.ok(!w.calls().some((c) => c[0] === 'repo' && c[1] === 'view'), 'a saved answer is not asked of GitHub');
+});
+
+test('with no saved answer, GitHub\'s visibility decides; one that can\'t be read counts as public', async () => {
+  const priv = summaryWorld('Ports the codex parser.', [{ match: ['repo', 'view'], stdout: { visibility: 'PRIVATE' } }]);
+  let s0 = await createSprint(priv.root, { name: 'x', tickets: [T()] }, { cwd: priv.w.repo });
+  await run(priv.root, s0.id, priv.w.env, (x) => x.tickets[0].state === 'pr-open');
+  assert.equal(bodyOf(priv.w), `Ports the codex parser.\n\n${BODY}`);
+  // The default fake gh has no answer for "repo view", so it fails.
+  const unknown = summaryWorld('Ports the codex parser.');
+  s0 = await createSprint(unknown.root, { name: 'x', tickets: [T()] }, { cwd: unknown.w.repo });
+  await run(unknown.root, s0.id, unknown.w.env, (x) => x.tickets[0].state === 'pr-open');
+  assert.equal(bodyOf(unknown.w), BODY);
+});
+
+const CI_PLAN = "# Plan\n\n### Task 1: Add a.txt\nWrite a.txt.\n\n### Task 2: Add b.txt\nWrite b.txt. Its CI check is listed below.\n\n## Checked by the PR's CI\n- CI is green on every OS\n- No Node 20 deprecation annotations\n\n## Done\n";
+const CI_LIST = ['CI is green on every OS', 'No Node 20 deprecation annotations'];
+const checkRun = (status, conclusion = null) => ({ __typename: 'CheckRun', name: 'test (windows)', status, conclusion, detailsUrl: 'https://github.com/o/r/actions/runs/5/job/1' });
+const ghView = (w, rollup) => {
+  const file = w.env.PODIUM_FAKE_GH;
+  const spec = JSON.parse(fs.readFileSync(file, 'utf8'));
+  spec.responses = [...spec.responses.filter((r) => !(r.match[0] === 'pr' && r.match[1] === 'view')), { match: ['pr', 'view'], stdout: { state: 'OPEN', mergeable: 'MERGEABLE', reviewDecision: '', statusCheckRollup: rollup, comments: [], reviews: [], mergeCommit: null } }];
+  fs.writeFileSync(file, JSON.stringify(spec));
+};
+function ciWorld() {
+  const { root, w } = sprintWorld({ plans: { 'docs/plan.md': CI_PLAN } });
+  scriptAgent(root, 'fa', [{ write: 'a.txt', say: 'did a' }, { write: 'b.txt', say: 'did b' }]);
+  scriptAgent(root, 'fr', [{ say: 'VERDICT: pass' }, { say: 'VERDICT: pass' }]);
+  return { root, w };
+}
+
+test('a plan with checks left to the PR\'s CI reaches its PR, which lists them', async () => {
+  const { root, w } = ciWorld();
+  const s0 = await createSprint(root, { name: 'x', tickets: [T()] }, { cwd: w.repo });
+  assert.deepEqual(loadSprint(root, s0.id).tickets[0].ciChecks, CI_LIST);
+  const s = await run(root, s0.id, w.env, (x) => ['pr-open', 'parked'].includes(x.tickets[0].state));
+  assert.equal(s.tickets[0].state, 'pr-open', s.tickets[0].reason);
+  const create = created(w);
+  const body = create[create.indexOf('--body-text') + 1];
+  assert.match(body, /\n\nChecked by the PR's CI:\n- CI is green on every OS\n- No Node 20 deprecation annotations\n/);
+  const pr = readJob(listJobDirs(root).find((d) => d.endsWith(s.tickets[0].latest))).pr;
+  assert.deepEqual(pr.ciChecks, CI_LIST);
+  assert.deepEqual(sprintSummary(root, loadSprint(root, s0.id)).tickets[0].ci, { state: 'waiting', checks: CI_LIST, failing: [] });
+});
+
+test('the ticket\'s CI state follows the PR\'s CI, and its sprint is told; a failure never parks it', async () => {
+  const { root, w } = ciWorld();
+  const s0 = await createSprint(root, { name: 'x', tickets: [T()] }, { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'pr-open');
+  const id = s.tickets[0].latest;
+  ghView(w, [checkRun('IN_PROGRESS')]);
+  await refreshPr(root, id, { env: w.env });
+  assert.equal(sprintSummary(root, loadSprint(root, s0.id)).tickets[0].ci.state, 'waiting');
+  ghView(w, [checkRun('COMPLETED', 'FAILURE')]);
+  await refreshPr(root, id, { env: w.env });
+  const failed = sprintSummary(root, loadSprint(root, s0.id)).tickets[0];
+  assert.deepEqual(failed.ci, { state: 'failed', checks: CI_LIST, failing: ['test (windows)'] });
+  assert.equal(failed.state, 'pr-open');
+  // A tick leaves it where it is: the PR is the place to fix it.
+  assert.equal((await tick(root, s0.id, { env: w.env })).tickets[0].state, 'pr-open');
+  ghView(w, [checkRun('COMPLETED', 'SUCCESS')]);
+  await refreshPr(root, id, { env: w.env });
+  assert.equal(sprintSummary(root, loadSprint(root, s0.id)).tickets[0].ci.state, 'passed');
+  const said = loadSprint(root, s0.id).messages.map((m) => m.text);
+  assert.ok(said.some((x) => /^ABC-11: Login form \(PR #12\): CI failed \(test \(windows\)\)/.test(x)), said.join('\n'));
+  assert.ok(said.some((x) => /^ABC-11: Login form \(PR #12\): CI passed, so the checks the plan left to it passed: CI is green on every OS; No Node 20 deprecation annotations\.$/.test(x)), said.join('\n'));
+});
+
+test('a ticket whose plan left nothing to CI has no CI state', async () => {
+  const { root, w } = world();
+  const s0 = await createSprint(root, { name: 'x', tickets: [T()] }, { cwd: w.repo });
+  await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'pr-open');
+  const s = loadSprint(root, s0.id);
+  assert.equal('ciChecks' in s.tickets[0], false);
+  assert.equal('ci' in sprintSummary(root, s).tickets[0], false);
 });

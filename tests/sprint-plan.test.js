@@ -2,11 +2,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import { createSprint, tick, loadSprint, saveSprint, sprintSummary, wantsRunner, retryTicket, assignTask, approvePlan, revisePlan, RETRY_MS } from '../engine/sprint.js';
 import { listJobDirs, readJob, findJobDir } from '../engine/store.js';
 import { main } from '../engine/cli.js';
+import { setSetting } from '../engine/settings.js';
+import { projectKey } from '../engine/paths.js';
 import { waitFor, scriptAgent, sprintWorld } from './helpers.js';
 
 const NOW = Date.parse('2026-10-07T10:00:00Z');
@@ -82,6 +85,21 @@ test('a ticket whose saved plan path is in another folder is planned there and i
   assert.deepEqual(s.tickets[0].proposed.map((x) => x.title), ['Add the export button', 'Write the CSV']);
 });
 
+// A repo that keeps plans elsewhere has its tickets planned there: the prompt names the repo's folder.
+test('a repo with its own plans folder is planned there', async () => {
+  const OWN = 'docs/custom/plans/2026-10-07-abc-14-export-to-csv.md';
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ write: OWN, content: PLAN2 }]);
+  scriptAgent(root, 'fr', []);
+  setSetting(root, 'repoPlanDir', { [projectKey(w.repo)]: 'docs/custom/plans' });
+  const s0 = await createSprint(root, { name: 'Oct', tickets: [P()] }, { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, settled);
+  assert.equal(s.tickets[0].state, 'plan-ready', s.tickets[0].reason);
+  assert.equal(s.tickets[0].plan, OWN);
+  assert.ok(promptOf(root, jobsBy(root, 'author')[0]).includes(`save it as ${OWN}`));
+  assert.deepEqual(s.tickets[0].proposed.map((x) => x.title), ['Add the export button', 'Write the CSV']);
+});
+
 test('a plan with no "### Task N:" headings waits as "Couldn\'t find tasks in this plan"', async () => {
   const { root, w } = sprintWorld();
   scriptAgent(root, 'fa', [{ write: FILE, content: '# Export\n\nJust do it all.\n' }]);
@@ -141,6 +159,43 @@ test('a writer that writes no plan file parks the ticket saying so; Retry asks a
   const s2 = await run(root, s0.id, w.env, settled);
   assert.equal(s2.tickets[0].state, 'plan-ready');
   assert.ok(promptOf(root, jobsBy(root, 'author')[1]).includes(FILE));
+});
+
+// The writer followed the repo's own instructions and saved the plan elsewhere: with exactly one new .md file
+// holding task headings, that is the plan, and it is no stray file.
+test('a plan written to another folder is adopted: plan-ready, with the ticket\'s plan set to it', async () => {
+  const ELSEWHERE = 'docs/custom/plans/abc-14.md';
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ write: ELSEWHERE, content: PLAN2 }]);
+  scriptAgent(root, 'fr', []);
+  const s0 = await createSprint(root, { name: 'Oct', tickets: [P()] }, { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, settled);
+  const t = s.tickets[0];
+  assert.equal(t.state, 'plan-ready', t.reason);
+  assert.equal(t.plan, ELSEWHERE);
+  assert.deepEqual(t.proposed.map((x) => x.title), ['Add the export button', 'Write the CSV']);
+  const [plan] = jobsBy(root, 'author');
+  assert.ok(s.messages.at(-1).text.includes(path.join(plan.worktree, ELSEWHERE)), 'the news names the adopted plan in Podium\'s copy');
+});
+
+test('two plans written away from the path still park naming the expected one', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ write: 'docs/a.md', content: PLAN2, also: { 'docs/b.md': PLAN2 } }]);
+  scriptAgent(root, 'fr', []);
+  const s0 = await createSprint(root, { name: 'Oct', tickets: [P()] }, { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, settled);
+  assert.equal(s.tickets[0].state, 'parked');
+  assert.equal(s.tickets[0].reason, `Fa finished without writing the plan to ${FILE}`);
+});
+
+test('a new .md file without task headings is no plan: the ticket parks as when nothing was written', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ write: 'docs/notes.md', content: '# Notes\n\nJust thinking out loud.\n' }]);
+  scriptAgent(root, 'fr', []);
+  const s0 = await createSprint(root, { name: 'Oct', tickets: [P()] }, { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, settled);
+  assert.equal(s.tickets[0].state, 'parked');
+  assert.equal(s.tickets[0].reason, `Fa finished without writing the plan to ${FILE}`);
 });
 
 test('the writer of a plan being written cannot change; once it waits, it can', async () => {
@@ -394,12 +449,12 @@ test('Approve makes the plan\'s tasks the ticket\'s, with its writer and reviewe
   const reviews = jobsBy(root, 'reviewer');
   assert.doesNotMatch(promptOf(root, reviews[0]), /export-to-csv\.md/, 'task 1 is reviewed on its own diff, not the plan');
   assert.equal(reviews[1].agent, 'fb');
-  // The plan and both tasks reach the PR as one commit, named for the ticket.
+  // Both tasks reach the PR as one commit, named for the ticket (the plan stays in the copy's history).
   assert.deepEqual(w.git(w.remote, 'log', '--format=%s', `${w.git(w.repo, 'rev-parse', 'main')}..feat/abc-14-export-to-csv`).split('\n'), ['ABC-14: Export to CSV']);
   assert.equal(s.tickets[0].pr.number, 12);
   // The approved tasks' titles are in the PR body, which lists them.
   const create = w.calls().find((c) => c[0] === 'pr' && c[1] === 'create');
-  assert.match(create[create.indexOf('--body-text') + 1], /Changes:\n- Add the export button\n- Write the CSV$/);
+  assert.match(create[create.indexOf('--body-text') + 1], /Changes:\n- Add the export button\n- Write the CSV\n\nTested: /);
   await assert.rejects(approvePlan(root, s0.id, 'ABC-14'), (e) => e.code === 'no-plan-waiting' && e.message === 'ABC-14 has no plan waiting for approval.');
 });
 
@@ -535,4 +590,120 @@ test('Approve starts the tasks\' counts afresh: a retried plan\'s task 1 fails t
   assert.deepEqual([a.tickets[0].retries, a.tickets[0].fails], [0, 0]);
   const s = await run(root, s0.id, w.env, settled);
   assert.deepEqual([s.tickets[0].state, s.tickets[0].reason], ['parked', 'Review failed twice on task 1']);
+});
+
+test('a file whose task headings are only inside code fences (a format guide) is no plan to adopt', async () => {
+  const GUIDE = '# How we write plans\n\nUse headings like these:\n\n```md\n### Task 1: Add the export button\nAdd it.\n```\n';
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ write: 'docs/plan-format.md', content: GUIDE }]);
+  scriptAgent(root, 'fr', []);
+  const s0 = await createSprint(root, { name: 'Oct', tickets: [P()] }, { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, settled);
+  assert.equal(s.tickets[0].state, 'parked');
+  assert.equal(s.tickets[0].reason, `Fa finished without writing the plan to ${FILE}`);
+});
+
+test('a link to a file is never adopted as the plan: it could point outside the copy', async (t) => {
+  const outside = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'podium-outside-')), 'plan.md');
+  fs.writeFileSync(outside, PLAN2);
+  const { root, w } = sprintWorld();
+  // The writer leaves a link to it in the copy (a scripted step can't make links, so the test does once the copy exists).
+  scriptAgent(root, 'fa', [{ say: 'Linked the plan.', ms: 1500 }]);
+  scriptAgent(root, 'fr', []);
+  const s0 = await createSprint(root, { name: 'Oct', tickets: [P()] }, { cwd: w.repo });
+  const planning = await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'running' && x.tickets[0].latest);
+  const copy = jobNow(root, planning.tickets[0].latest).worktree;
+  try {
+    fs.symlinkSync(outside, path.join(copy, 'docs', 'linked.md'));
+  } catch {
+    fs.mkdirSync(path.join(copy, 'docs'), { recursive: true });
+    try { fs.symlinkSync(outside, path.join(copy, 'docs', 'linked.md')); } catch { t.skip('this machine cannot make links'); return; }
+  }
+  const s = await run(root, s0.id, w.env, settled);
+  assert.equal(s.tickets[0].state, 'parked');
+  assert.equal(s.tickets[0].reason, `Fa finished without writing the plan to ${FILE}`);
+});
+// A plan that runs a production command waits for the person's explicit say-so.
+const PROD_PLAN = '# Export to CSV\n\n### Task 1: Add the export button\nAdd it.\n\n### Task 2: Remove the old export\n```bash\nsupabase functions delete export-v1 --project-ref live\n```\n';
+
+test('a plan that runs a production command says so, and Approve without acknowledge is refused', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ write: FILE, content: PROD_PLAN }]);
+  scriptAgent(root, 'fr', []);
+  const s0 = await createSprint(root, { name: 'Oct', tickets: [P()] }, { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, settled);
+  const t = s.tickets[0];
+  assert.equal(t.state, 'plan-ready');
+  assert.deepEqual(t.attention.map(({ id, ...x }) => x), [{ n: 2, title: 'Remove the old export', command: 'supabase functions delete export-v1 --project-ref live' }]);
+  const news = s.messages.at(-1).text;
+  assert.match(news, /^ABC-14's plan needs your attention: it runs a production command \("supabase functions delete export-v1 --project-ref live"\), and is ready: 2 tasks\.\n/);
+  assert.match(news, /Needs your attention: task 2: supabase functions delete export-v1 --project-ref live\. Tell the person/);
+  assert.match(news, /action "approve" \(id \S+, ticket ABC-14\), with acknowledge: true once the person has agreed/);
+  assert.deepEqual(sprintSummary(root, s).tickets[0].attention, [{ n: 2, command: 'supabase functions delete export-v1 --project-ref live' }]);
+  await assert.rejects(approvePlan(root, s0.id, 'ABC-14'), (e) => e.code === 'needs-acknowledge'
+    && e.message === "ABC-14's plan runs production commands (task 2: supabase functions delete export-v1 --project-ref live). Approve it only once the person has agreed to them (acknowledge), or ask for changes.");
+  assert.equal(loadSprint(root, s0.id).tickets[0].state, 'plan-ready', 'nothing changed');
+  const a = await approvePlan(root, s0.id, 'ABC-14', { acknowledge: true });
+  assert.deepEqual([a.tickets[0].state, a.tickets[0].of ?? a.tickets[0].tasks.length, a.tickets[0].attention], ['pending', 2, null]);
+});
+
+test('a clean plan approves as before, and its news asks for nothing more', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ write: FILE, content: PLAN2 }]);
+  scriptAgent(root, 'fr', []);
+  const s0 = await createSprint(root, { name: 'Oct', tickets: [P()] }, { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, settled);
+  assert.equal(s.tickets[0].attention, null);
+  assert.doesNotMatch(s.messages.at(-1).text, /attention|acknowledge/);
+  assert.equal(sprintSummary(root, s).tickets[0].attention, null);
+  assert.equal((await approvePlan(root, s0.id, 'ABC-14')).tickets[0].state, 'pending');
+});
+
+test('a repo\'s own production pattern flags a plan, even one added after it was written; the CLI takes --acknowledge', async () => {
+  const { root, w } = sprintWorld();
+  const plan = '# Export\n\n### Task 1: Ship it\nRun ./scripts/deploy-prod.sh when done.\n';
+  scriptAgent(root, 'fa', [{ write: FILE, content: plan }]);
+  scriptAgent(root, 'fr', []);
+  const s0 = await createSprint(root, { name: 'Oct', tickets: [P()] }, { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, settled);
+  assert.equal(s.tickets[0].attention, null, 'nothing on the built-in list');
+  setSetting(root, 'repoProdPatterns', { [projectKey(w.repo)]: ['deploy-prod'] });
+  // The board shows what approval will ask about, so the pane asks first.
+  assert.deepEqual(sprintSummary(root, loadSprint(root, s0.id)).tickets[0].attention, [{ n: 1, command: 'Run ./scripts/deploy-prod.sh when done.' }]);
+  const spawn = () => {};
+  const refused = await cli(root, ['sprint', 'approve', '--id', s0.id, '--ticket', 'ABC-14'], { spawn });
+  assert.equal(refused.body.error.code, 'needs-acknowledge');
+  assert.match(refused.body.error.message, /task 1: Run \.\/scripts\/deploy-prod\.sh when done\./);
+  const ok = await cli(root, ['sprint', 'approve', '--id', s0.id, '--ticket', 'ABC-14', '--acknowledge'], { spawn });
+  assert.equal(ok.code, 0);
+  assert.equal(ok.body.sprint.tickets[0].state, 'pending');
+});
+
+test('Run as one task also waits for the say-so when the plan runs a production command', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ write: FILE, content: '# Export\n\nBuild it, then `npm publish` the package.\n' }]);
+  scriptAgent(root, 'fr', []);
+  const s0 = await createSprint(root, { name: 'Oct', tickets: [P()] }, { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, settled);
+  assert.equal(s.tickets[0].state, 'no-tasks');
+  assert.match(s.messages.at(-1).text, /^ABC-14's plan needs your attention: it runs a production command \("Build it, then `npm publish` the package\."\), and is written, but Podium couldn't find tasks in it\.\n/);
+  await assert.rejects(approvePlan(root, s0.id, 'ABC-14', { whole: true }), (e) => e.code === 'needs-acknowledge');
+  assert.equal((await approvePlan(root, s0.id, 'ABC-14', { whole: true, acknowledge: true })).tickets[0].state, 'pending');
+});
+
+test('a plan with more production commands than are kept counts the rest: the news, the board and approval all know', async () => {
+  const { root, w } = sprintWorld();
+  const pushes = Array.from({ length: 25 }, (_, i) => `git push origin b${i}`).join('\n');
+  scriptAgent(root, 'fa', [{ write: FILE, content: `# Export\n\n### Task 1: Push them\n${pushes}\n` }]);
+  scriptAgent(root, 'fr', []);
+  const s0 = await createSprint(root, { name: 'Oct', tickets: [P()] }, { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, settled);
+  assert.deepEqual([s.tickets[0].attention.length, s.tickets[0].attentionMore], [20, 5]);
+  assert.match(s.messages.at(-1).text, /^ABC-14's plan needs your attention: it runs 25 production commands \("git push origin b0" and 24 more\), and is ready: 1 task\.\n/);
+  assert.match(s.messages.at(-1).text, /; and 5 more\. Read the plan for the ones not listed here\./);
+  const sum = sprintSummary(root, s).tickets[0];
+  assert.deepEqual([sum.attention.length, sum.attentionMore], [20, 5]);
+  await assert.rejects(approvePlan(root, s0.id, 'ABC-14'), (e) => e.code === 'needs-acknowledge' && /; and 22 more\)/.test(e.message));
+  const a = await approvePlan(root, s0.id, 'ABC-14', { acknowledge: true });
+  assert.deepEqual([a.tickets[0].attention, a.tickets[0].attentionMore], [null, null]);
 });

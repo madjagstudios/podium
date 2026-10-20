@@ -5,11 +5,11 @@
 import { atom, read, update } from 'claude-code'
 import type { Engine, Register } from 'claude-code'
 import { callEngine } from '../mod/engine.js'
-import { handOver, sprintNewsPass, keepFresh } from '../mod/delivery.js'
+import { handOver, sprintNewsPass, keepFresh, arrivals } from '../mod/delivery.js'
 import { parseCommand } from '../mod/commands.js'
 import { TOOLS, engineCall, formatToolResult } from '../mod/tools.js'
-import { agentLabel, organise, threads, sprintNewsHeadline, sprintNewsNotes, foldsLeaving, startedNotice } from '../mod/view.js'
-import { askText, isPrEvent, finishedHeadline, finishedMessage, jobLine, shortSummary, summaryPrompt, newlyFinished, paletteName, parseLive, same, statusText } from '../mod/view.js'
+import { agentLabel, organise, threads, sprintNewsHeadline, newsHandOver, jobHandOver, foldsLeaving, startedNotice, syncedText, commitsAnswerText, notedText } from '../mod/view.js'
+import { askText, isPrEvent, jobLine, shortSummary, summaryPrompt, newlyFinished, paletteName, parseLive, same, statusText } from '../mod/view.js'
 import type { AdapterDraft, AgentRecord, AskForm, BoardState, DoctorReport, Draft, JobDetail, JobOpen, JobRecord, LiveInfo, PaneView, RemovalPlan, SprintSummary, WhatsNew } from '../types'
 import { PANE, NOTE_CHARS, FOLDS_KEPT } from './state'
 import { drawPane, NO_BOARD } from './screens'
@@ -74,8 +74,14 @@ const delivering = new Set<string>()
 const announcedNews = new Set<string>()
 // Sprint news being sent right now: a later pass that claims it again skips it.
 const newsInFlight = new Set<string>()
+// This running copy of the mod, as the holder of the sprint news it claims: only it renews those claims, so a copy
+// loaded again in the same chat never keeps the other's alive, nor the other its own.
+const NEWS_HOLDER = `mod-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 // A news pass is running: sprintNewsPass runs one at a time, so a pass waiting on a busy turn is never joined by another.
 const newsBusy = { on: false }
+// Hand-overs waiting for their prompt to enter: a turn that starts holding one's headline lets it count as in (the
+// host settles only the last of several prompts it starts as one turn). Fed by the turn.start hook.
+const entering = arrivals()
 // The delivery lock goes stale after a minute; its holder refreshes it this often while its submit waits.
 const LOCK_REFRESH_MS = 20_000
 // Set inside agent runs Podium itself started (PODIUM_JOB_ID): the mod then does nothing.
@@ -224,12 +230,13 @@ async function clearDone($: Engine) {
 
 async function deliverFinished($: Engine) {
   await refresh($)
-  for (const job of newlyFinished(await read($, jobs))) await deliver($, job)
+  for (const job of newlyFinished(await read($, jobs), { session: await chatId($), now: Date.now() })) await deliver($, job)
   await deliverSprintNews($)
 }
 
 // Sprint news: plans, parked tickets and finished sprints, batched into one
-// message. Claim → submit → mark, like jobs; a claim never confirmed expires in 2 minutes.
+// message. Claim → submit → mark, like jobs; the claim is renewed while the submit waits, and one never confirmed expires
+// in 2 minutes.
 // News announced whose mark failed waits in `announcedNews` and is never announced twice (sprintNewsPass).
 // One pass at a time: a pass that finds one running returns at once (newsBusy, held by sprintNewsPass).
 async function deliverSprintNews($: Engine) {
@@ -244,7 +251,7 @@ async function deliverSprintNews($: Engine) {
     // has no news and is never polled for it.
     hasNews: async () => Boolean(session) && (await read($, sprints)).some((s) => !s.archived && s.news > 0 && (!s.chat || s.chat === session)),
     claim: async () => {
-      const r = await engine($, ['sprint', 'inbox', '--session', session as string, '--here'])
+      const r = await engine($, ['sprint', 'inbox', '--session', session as string, '--instance', NEWS_HOLDER, '--here'])
       return r.ok ? r.value.messages : []
     },
     tellClaude: async () => {
@@ -253,13 +260,20 @@ async function deliverSprintNews($: Engine) {
     },
     // Details first as a hidden row; if that fails they ride in the visible message. If the submit
     // fails, nothing is marked: the claim expires and it is tried again.
-    send: (list: News[]) => handOver({
-      append: () => $.session.append({ message: { type: 'user', content: [{ type: 'text', text: sprintNewsNotes(list) }] } } as any),
-      headline: sprintNewsHeadline(list),
-      details: sprintNewsNotes(list, true), // visible variant: only used if the hidden row fails
-      submit: (text: string) => $.prompt.submit({ text }),
-    }),
+    send: (list: News[]) => {
+      const { notes, headline, details } = newsHandOver(list)
+      return handOver({
+        append: () => $.session.append({ message: { type: 'user', content: [{ type: 'text', text: notes }] } } as any),
+        headline,
+        details,
+        submit: (text: string) => $.prompt.submit({ text }),
+        arrived: (h: string) => entering.expect(h),
+      })
+    },
     toast: (list: News[]) => $.ui.toast(sprintNewsHeadline(list)),
+    // The claims are renewed while the send waits, as a job's delivery lock is.
+    sleep: () => $.clock.sleep(LOCK_REFRESH_MS),
+    refresh: (ids: string[]) => engine($, ['sprint', 'refresh', '--session', session as string, '--instance', NEWS_HOLDER, '--ids', ids.join(',')]),
     mark: async (ids: string[]) => {
       const r = await engine($, ['sprint', 'delivered', '--ids', ids.join(',')])
       return r.ok ? { failed: r.value.failed ?? [] } : null
@@ -308,11 +322,13 @@ async function deliver($: Engine, job: JobRecord) {
       // hook only worked in the kit: in the app the notes never arrived.) If the hidden row
       // cannot be added, the details ride in the visible message. A failed submit releases the
       // job to be tried again, never marked with Claude missing the report.
+      const { notes, headline, details } = jobHandOver(job, summary)
       const ok = await handOver({
-        append: () => $.session.append({ message: { type: 'user', content: [{ type: 'text', text: finishedMessage(job, summary) }] } } as any),
-        headline: finishedHeadline(job),
-        details: finishedMessage(job, summary, true), // visible variant: only used if the hidden row fails
+        append: () => $.session.append({ message: { type: 'user', content: [{ type: 'text', text: notes }] } } as any),
+        headline,
+        details,
         submit: (text: string) => $.prompt.submit({ text }),
+        arrived: (h: string) => entering.expect(h),
       })
       return { tell, ok }
     }, {
@@ -451,8 +467,8 @@ function inSprintOrder(id: string, press: string, work: () => Promise<unknown>):
 const SPRINT_CHANGES: Record<string, (args: unknown[]) => unknown> = {
   sprintAct: (args) => args[1], setSprintOptions: (args) => args[0], moveTicket: (args) => args[0],
   removeTicket: (args) => args[0], assignTicket: (args) => args[0], assignTask: (args) => args[0],
-  retryTicket: (args) => args[0], stopTicket: (args) => args[0],
-  approvePlan: (args) => args[0], revisePlan: (args) => args[0], setAfter: (args) => args[0],
+  retryTicket: (args) => args[0], stopTicket: (args) => args[0], syncTicket: (args) => args[0], answerCommits: (args) => args[0],
+  approvePlan: (args) => args[0], revisePlan: (args) => args[0], addNote: (args) => args[0], acceptTests: (args) => args[0], reviewWithEvidence: (args) => args[0], setAfter: (args) => args[0],
   takeSprintNews: (args) => args[0],
 }
 
@@ -495,6 +511,12 @@ async function stopTicketAct($: Engine, id: string, key: string) {
   await sprintCall($, ['stop', '--id', id, '--ticket', key], `${key} stopped.`)
 }
 
+// Keep or Drop the commits in a ticket's copy that Podium didn't make. Drop's question closes first.
+async function answerCommitsAct($: Engine, id: string, key: string, keep: boolean) {
+  await update($, board, (cur) => ({ ...cur, confirm: null }))
+  await sprintCall($, ['commits', '--id', id, '--ticket', key, '--answer', keep ? 'keep' : 'drop'], (v) => commitsAnswerText(key, keep, v?.dropped ?? [], v?.saved ?? null))
+}
+
 // Ask for changes to a plan: the notes go to its writer; the form closes once Podium has them, and
 // stays with the notes if it refused. The press carries the notes as they were when Send was pressed: a Send
 // may wait behind other changes in its sprint, and by the time it runs the board may show another ticket's notes. So
@@ -508,7 +530,34 @@ async function revisePlanAct($: Engine, id: string, key: string, typed?: string)
   if (ok) await update($, board, (cur) => (same(cur) ? { ...cur, confirm: null, note: '' } : cur))
 }
 
-// Notes typed for a plan: kept to the engine's length (it cuts them too), which also keeps them within the pane's props.
+// A note for a ticket's agents, from its Add a note form: sent and closed as a plan's notes are (revisePlanAct).
+async function addNoteAct($: Engine, id: string, key: string, typed?: string) {
+  const text = (typed ?? (await read($, board)).note ?? '').slice(0, NOTE_CHARS).trim()
+  if (!text) { await say($, 'Write the note first.'); return }
+  const ok = await sprintCall($, ['note', '--id', id, '--ticket', key, '--text', '-'], (v) => notedText(key, Boolean(v?.noted?.running)), text)
+  const same = (cur: BoardState) => cur.sprint === id && cur.confirm === `note:${key}` && ['', text].includes((cur.note ?? '').trim())
+  if (ok) await update($, board, (cur) => (same(cur) ? { ...cur, confirm: null, note: '' } : cur))
+}
+
+// Accept and continue, from its form: the person's reason goes in, and the form closes as a note's does (addNoteAct).
+async function acceptTestsAct($: Engine, id: string, key: string, typed?: string) {
+  const text = (typed ?? (await read($, board)).note ?? '').slice(0, NOTE_CHARS).trim()
+  if (!text) { await say($, 'Say why the test results are fine first.'); return }
+  const ok = await sprintCall($, ['accept', '--id', id, '--ticket', key, '--text', '-'], `Accepted: ${key}'s task goes to its review.`, text)
+  const same = (cur: BoardState) => cur.sprint === id && cur.confirm === `accept:${key}` && ['', text].includes((cur.note ?? '').trim())
+  if (ok) await update($, board, (cur) => (same(cur) ? { ...cur, confirm: null, note: '' } : cur))
+}
+
+// Review again with evidence, from its form: the person's words go in, and the form closes as Accept's does.
+async function evidenceAct($: Engine, id: string, key: string, typed?: string) {
+  const text = (typed ?? (await read($, board)).note ?? '').slice(0, NOTE_CHARS).trim()
+  if (!text) { await say($, 'Say what the reviewer should weigh first.'); return }
+  const ok = await sprintCall($, ['evidence', '--id', id, '--ticket', key, '--text', '-'], `${key}'s task goes back to its review with your evidence.`, text)
+  const same = (cur: BoardState) => cur.sprint === id && cur.confirm === `evidence:${key}` && ['', text].includes((cur.note ?? '').trim())
+  if (ok) await update($, board, (cur) => (same(cur) ? { ...cur, confirm: null, note: '' } : cur))
+}
+
+// Notes typed for a plan or a ticket: kept to the engine's length (it cuts them too), which also keeps them within the pane's props.
 async function editNote($: Engine, id: string, text: string) {
   const typed = String(text ?? '')
   const note = typed.slice(0, NOTE_CHARS)
@@ -811,8 +860,13 @@ function actions($: Engine) {
     assignTask: (id: string, key: string, n: number, role: 'agent' | 'reviewer', name: string) => assignAct($, ['--id', id, '--ticket', key, '--task', String(n), `--${role}`, name]),
     retryTicket: (id: string, key: string, agent?: string) => sprintCall($, ['retry', '--id', id, '--ticket', key, ...(agent ? ['--agent', agent] : [])], agent ? `${key} goes to ${agentLabel(agent)}.` : `${key} tries again.`),
     stopTicket: (id: string, key: string) => stopTicketAct($, id, key),
-    approvePlan: (id: string, key: string, whole?: boolean) => sprintCall($, [whole ? 'one-task' : 'approve', '--id', id, '--ticket', key], whole ? `${key} runs as one task.` : `${key} approved.`),
+    syncTicket: (id: string, key: string) => sprintCall($, ['sync', '--id', id, '--ticket', key], (v) => syncedText(key, v?.sprint?.base, Number(v?.commits ?? 0), v?.saved ?? null)),
+    answerCommits: (id: string, key: string, keep: boolean) => answerCommitsAct($, id, key, keep),
+    approvePlan: (id: string, key: string, whole?: boolean, acknowledge?: boolean) => sprintCall($, [whole ? 'one-task' : 'approve', '--id', id, '--ticket', key, ...(acknowledge ? ['--acknowledge'] : [])], whole ? `${key} runs as one task.` : `${key} approved.`),
     revisePlan: (id: string, key: string, text?: string) => revisePlanAct($, id, key, text),
+    addNote: (id: string, key: string, text?: string) => addNoteAct($, id, key, text),
+    acceptTests: (id: string, key: string, text?: string) => acceptTestsAct($, id, key, text),
+    reviewWithEvidence: (id: string, key: string, text?: string) => evidenceAct($, id, key, text),
     editNote: (id: string, text: string) => editNote($, id, text),
     setAfter: (id: string, key: string, other: string, on: boolean) => sprintCall($, ['after', '--id', id, '--ticket', key, on ? '--add' : '--drop', other]),
     takeSprintNews: (id: string) => takeSprintNews($, id),
@@ -875,6 +929,11 @@ export const register: Register = on => {
       if ((anyWorking && ticks % 3 === 0) || ticks % 15 === 0) quietly(deliverFinished($))
     })
     return started
+  })
+
+  on('turn.start', async ($, e, next) => {
+    if (!inert) entering.turnStarted(e.text)
+    return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {

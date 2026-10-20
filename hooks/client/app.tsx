@@ -45,12 +45,13 @@ export default function PodiumApp(model: PaneModel, surface: any) {
   }
   const send = (name: string, args: unknown[]) => {
     if (!box) return
-    // A plan's Send carries the notes as they are now, and the last words typed here may not be in this model's
-    // board yet: Send takes them when they were typed under its own question. Anything else that moves the board drops them.
+    // A plan's Send (or a note's Save) carries the words as they are now, and the last words typed here may not be in this
+    // model's board yet: it takes them when they were typed under its own form. Anything else that moves the board drops them.
     if (name === 'editNote') box.typed = { sprint: String(args[0]), confirm: model.board?.confirm ?? null, text: String(args[1] ?? '') }
-    else if (name === 'revisePlan') {
+    else if (name === 'revisePlan' || name === 'addNote' || name === 'acceptTests' || name === 'reviewWithEvidence') {
       const t = box.typed
-      if (t && t.sprint === args[0] && t.confirm === `revise:${args[1]}`) args = [args[0], args[1], t.text]
+      const form = ({ revisePlan: 'revise', addNote: 'note', acceptTests: 'accept', reviewWithEvidence: 'evidence' } as Record<string, string>)[name]
+      if (t && t.sprint === args[0] && t.confirm === `${form}:${args[1]}`) args = [args[0], args[1], t.text]
       box.typed = null
     } else if (NAV_ACTIONS.has(name) || ['askConfirm', 'openPicker'].includes(name)) box.typed = null
     box.seq += 1

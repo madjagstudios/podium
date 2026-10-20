@@ -7,8 +7,9 @@ import { saveAdapter } from '../engine/adapters/registry.js';
 import { createJob, updateJob, readJob } from '../engine/store.js';
 import { createWorktree } from '../engine/worktree.js';
 import { runJob, recordCrash } from '../engine/runner.js';
-import { tempRoot, tempRepo, fakeAdapter } from './helpers.js';
+import { tempRoot, tempRepo, fakeAdapter, scriptAgent } from './helpers.js';
 import { setSetting } from '../engine/settings.js';
+import * as runner from '../engine/runner.js';
 
 function setup(mode, extra = {}) {
   const root = tempRoot();
@@ -16,6 +17,110 @@ function setup(mode, extra = {}) {
   const { job, dir } = createJob(root, { project: 'demo', ticket: 'NO-TICKET', agent: 'fake', permission: 'read-only', cwd: tempRoot(), prompt: 'Do the task' });
   return { root, job, dir };
 }
+
+for (const kind of ['writer', 'reviewer', 'ordinary']) {
+  test(`${kind} launch receives the copy build defaults only when it has a copy`, async () => {
+    const { root, dir, job } = setup('ok');
+    const defaults = { UseSharedCompilation: 'false', DOTNET_CLI_USE_MSBUILD_SERVER: '0', MSBUILDDISABLENODEREUSE: '1' };
+    const inherited = { UseSharedCompilation: 'true', DOTNET_CLI_USE_MSBUILD_SERVER: '1', MSBUILDDISABLENODEREUSE: '0', PODIUM_JOB_ID: 'parent-job' };
+    const temps = ['TMPDIR', 'TEMP', 'TMP'];
+    const names = [...Object.keys(inherited), ...temps];
+    scriptAgent(root, 'fake', [{ envValues: names, ...(kind === 'reviewer' ? { env: 'TMPDIR' } : {}) }]);
+    let copy;
+    if (kind !== 'ordinary') {
+      const repo = tempRepo();
+      copy = path.join(root, 'worktrees', kind);
+      const branch = `podium/${job.id}`;
+      const base = await createWorktree(repo, copy, branch);
+      updateJob(root, dir, { permission: 'edit-worktree', repoRoot: repo, worktree: copy, branch, baseCommit: base, step: 2, scratchTmp: kind === 'reviewer' });
+    }
+    for (const name of temps) inherited[name] = path.join(copy || job.cwd, '.review-tmp');
+    const before = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    let result;
+    try {
+      Object.assign(process.env, inherited);
+      result = await runJob(root, dir);
+    } finally {
+      for (const [name, value] of Object.entries(before)) {
+        if (value === undefined) delete process.env[name]; else process.env[name] = value;
+      }
+    }
+    assert.equal(result.status, 'done');
+    const output = fs.readFileSync(path.join(dir, 'output.md'), 'utf8');
+    const values = JSON.parse(output.match(/^ENV_VALUES (.+)$/m)[1]);
+    const expected = { ...inherited, ...(copy ? defaults : {}), PODIUM_JOB_ID: job.id };
+    if (kind === 'reviewer') {
+      const tmp = path.resolve(dir, 'tmp');
+      for (const name of temps) expected[name] = tmp;
+      assert.match(output, /ENV TMPDIR=.* writable=true/);
+      assert.ok(path.relative(copy, tmp).startsWith('..'));
+      assert.equal(fs.existsSync(tmp), false);
+    }
+    assert.deepEqual(values, expected);
+    assert.equal(fs.existsSync(path.join(copy || job.cwd, '.review-tmp')), false);
+  });
+}
+
+test('scratch temp creation fails explicitly instead of inheriting an unsafe folder', () => {
+  const dir = tempRoot();
+  const denied = Object.assign(new Error('denied'), { code: 'EACCES' });
+  assert.equal(typeof runner.tempEnv, 'function');
+  assert.throws(
+    () => runner.tempEnv({ scratchTmp: true }, dir, { mkdir() { throw denied; } }),
+    (e) => e.code === 'review-temp-unavailable'
+      && e.message.includes('temporary folder')
+      && e.message.includes(path.resolve(dir, 'tmp'))
+      && e.details.cause === 'EACCES'
+  );
+  assert.deepEqual(runner.tempEnv({ scratchTmp: false }, dir, { mkdir() { assert.fail('not a scratch job'); } }), {});
+});
+
+test('scratch paths are absolute even for a relative job directory', () => {
+  const dir = tempRoot();
+  const tmp = path.resolve(dir, 'tmp');
+  assert.equal(typeof runner.tempEnv, 'function');
+  assert.deepEqual(runner.tempEnv({ scratchTmp: true }, path.relative(process.cwd(), dir)), { TMPDIR: tmp, TEMP: tmp, TMP: tmp });
+  fs.writeFileSync(path.join(tmp, 'probe.txt'), 'writable');
+});
+
+test('a scratch preparation error happens before output streams open or the agent starts', async () => {
+  const { root, dir } = setup('ok');
+  updateJob(root, dir, { scratchTmp: true });
+  fs.writeFileSync(path.join(dir, 'tmp'), 'a file blocks directory creation');
+  await assert.rejects(runJob(root, dir), (e) => e.code === 'review-temp-unavailable');
+  // Let any mistakenly opened streams finish opening before checking for their files.
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fs.existsSync(path.join(dir, 'output.md')), false);
+  assert.equal(fs.existsSync(path.join(dir, 'stderr.log')), false);
+  assert.equal(readJob(dir).agentPid, null);
+  assert.equal(readJob(dir).status, 'queued');
+});
+
+test('scratch jobs override all inherited temp variables with a writable folder outside the copy', async () => {
+  const { root, dir, job } = setup('ok');
+  const probe = path.join(root, 'temp-probe.cjs');
+  fs.writeFileSync(probe, `const fs = require('node:fs');
+    const path = require('node:path');
+    const values = Object.fromEntries(['TMPDIR', 'TEMP', 'TMP'].map(key => [key, process.env[key]]));
+    for (const [key, value] of Object.entries(values)) fs.writeFileSync(path.join(value, key), 'writable');
+    console.log(JSON.stringify(values));`);
+  saveAdapter(root, fakeAdapter('ok', { baseArgs: [probe] }));
+  updateJob(root, dir, { scratchTmp: true });
+  const inherited = Object.fromEntries(['TMPDIR', 'TEMP', 'TMP'].map(key => [key, process.env[key]]));
+  try {
+    for (const key of Object.keys(inherited)) process.env[key] = path.join(job.cwd, '.review-tmp');
+    await runJob(root, dir);
+  } finally {
+    for (const [key, value] of Object.entries(inherited)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+  const tmp = path.resolve(dir, 'tmp');
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'output.md'), 'utf8')), { TMPDIR: tmp, TEMP: tmp, TMP: tmp });
+  assert.ok(path.relative(job.cwd, tmp).startsWith('..'));
+  assert.equal(fs.existsSync(path.join(job.cwd, '.review-tmp')), false);
+  assert.equal(fs.existsSync(tmp), false);
+});
 
 test('a successful job streams output and finishes done', async () => {
   const { root, dir } = setup('ok');

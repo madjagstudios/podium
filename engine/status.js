@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { readJob, updateJob, listJobDirs, findJobDir } from './store.js';
 import { loadSettings } from './settings.js';
@@ -17,6 +18,33 @@ export function isAlive(pid) {
   } catch (e) {
     return e.code === 'EPERM';
   }
+}
+
+// When this machine last started. A pid recorded before then may belong to anything now.
+// Tests only: a fixed boot time (setBootTime), so a test can backdate a record on a machine that started minutes ago (a
+// fresh CI runner) without it reading as "recorded before the machine started".
+let bootOverride = null;
+export function setBootTime(at = null) { bootOverride = at; }
+export const bootTime = () => bootOverride ?? Date.now() - os.uptime() * 1000;
+
+// The longest anything waits for an agent whose runner is gone (agentLingers).
+export const AGENT_WAIT_MS = 2 * 60 * 60_000;
+
+// Whether a job's agent may still be running though its runner never saw it end: the job was found lost (its runner is
+// gone), its runner crashed, or it was cancelled, with no exit code recorded, and the agent's pid (recorded since this
+// machine started) is alive. Its runner started it as a process of its own, so it outlives the runner, and it may still
+// be writing in the job's copy: nothing else may start there until it ends. Podium only waits, never stops it (a pid may
+// belong to another program by now). For the same reason a live pid counts only until AGENT_WAIT_MS after the job ended
+// (agentAlive, without that bound, says whether it is alive still).
+export function agentLingers(job, { now = Date.now(), bootAt = bootTime() } = {}) {
+  if (!agentAlive(job, { bootAt })) return false;
+  const ended = Date.parse(job.endedAt);
+  return !(Number.isFinite(ended) && now - ended >= AGENT_WAIT_MS);
+}
+export function agentAlive(job, { bootAt = bootTime() } = {}) {
+  if (!job?.agentPid || job.exitCode != null || !['lost', 'failed', 'cancelled'].includes(job.status)) return false;
+  if (!(Date.parse(job.startedAt) >= bootAt)) return false;
+  return isAlive(job.agentPid);
 }
 
 export function reconcile(root, dir, { now = Date.now(), settings = loadSettings(root) } = {}) {

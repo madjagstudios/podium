@@ -5,9 +5,19 @@ import { Writable, Readable } from 'node:stream';
 import { createSprint, tick, loadSprint, setPaused, saveSprint, retryTicket } from '../engine/sprint.js';
 import { ensureSprints, sprintLoop, beatOf } from '../engine/sprint-run.js';
 import { main } from '../engine/cli.js';
+import path from 'node:path';
+import { listJobDirs, readJob } from '../engine/store.js';
 import { waitFor, scriptAgent, sprintWorld } from './helpers.js';
 
 const T = (over = {}) => ({ key: 'ABC-11', title: 'Login form', type: 'feat', plan: 'docs/plan.md', agent: 'fa', reviewer: 'fr', ...over });
+const draft = (tickets) => ({ name: 'Test sprint', tickets });
+// Tick until `until(sprint)` holds; each tick re-reads the sprint's state, as a restarted runner would.
+const run = (root, id, env, until, { now } = {}) => waitFor(async () => {
+  const s = await tick(root, id, { env, now: now ? now() : Date.now() });
+  return until(s) ? s : null;
+}, { timeoutMs: 90_000, intervalMs: 150 });
+const jobsBy = (root, role) => listJobDirs(root).map(readJob).filter((j) => j.sprint?.role === role).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+const promptOf = (root, job) => fs.readFileSync(path.join(listJobDirs(root).find((d) => d.endsWith(job.id)), 'prompt.md'), 'utf8');
 
 async function cli(root, argv, { stdin = '', cwd } = {}) {
   let out = '';
@@ -108,4 +118,56 @@ test('sprintLoop goes on when the sprint wants a runner again just as it clears 
   assert.equal(ticks, 2, 'it ticked again for the wake-up it would have missed');
   assert.equal(releases, 2);
   assert.equal(fs.existsSync(beatOf(root, s.id)), false);
+});
+
+test('a writer that changes no files parks with "made no changes", quoting its report, and Retry runs it again', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ say: 'I read the ticket key but could not open it.', tests: 'passed' }, { write: 'a.txt' }, { write: 'b.txt' }]);
+  scriptAgent(root, 'fr', [{ say: 'VERDICT: pass' }, { say: 'VERDICT: pass' }]);
+  const s0 = await createSprint(root, draft([T()]), { cwd: w.repo });
+  const parked = await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'parked');
+  const t = parked.tickets[0];
+  assert.equal(t.reason, 'Fa made no changes for task 1');
+  assert.equal(t.resume, 'author');
+  assert.ok(t.findings.endsWith('I read the ticket key but could not open it.'), t.findings);
+  assert.deepEqual(jobsBy(root, 'reviewer'), [], 'nothing went to review');
+  assert.match(parked.messages.at(-1).text, /needs you: Fa made no changes for task 1/);
+  await retryTicket(root, s0.id, 'ABC-11');
+  const done = await run(root, s0.id, w.env, (x) => ['pr-open', 'parked'].includes(x.tickets[0].state));
+  assert.equal(done.tickets[0].state, 'pr-open', done.tickets[0].reason);
+  assert.equal(jobsBy(root, 'reviewer').length, 2);
+});
+
+test('a writer that changes nothing but says why goes to review, and the reviewer is told', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ say: 'CHANGES: none-needed: a.txt already says this', tests: 'none-needed: nothing changed' }, { write: 'b.txt' }]);
+  scriptAgent(root, 'fr', [{ say: 'VERDICT: pass' }, { say: 'VERDICT: pass' }]);
+  const s0 = await createSprint(root, draft([T()]), { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, (x) => ['pr-open', 'parked'].includes(x.tickets[0].state));
+  assert.equal(s.tickets[0].state, 'pr-open', s.tickets[0].reason);
+  const review = promptOf(root, jobsBy(root, 'reviewer')[0]);
+  assert.ok(review.includes('The writer changed no files and said none were needed:'), review);
+  assert.ok(review.includes('a.txt already says this'), review);
+});
+
+test('a writer that changes files but also says none were needed is reviewed as a change, without the no-change note', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ write: 'a.txt', say: 'CHANGES: none-needed: the tests already cover it' }, { write: 'b.txt' }]);
+  scriptAgent(root, 'fr', [{ say: 'VERDICT: pass' }, { say: 'VERDICT: pass' }]);
+  const s0 = await createSprint(root, draft([T()]), { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, (x) => ['pr-open', 'parked'].includes(x.tickets[0].state));
+  assert.equal(s.tickets[0].state, 'pr-open', s.tickets[0].reason);
+  const review = promptOf(root, jobsBy(root, 'reviewer')[0]);
+  assert.ok(review.includes('a.txt'), 'the change is in the review');
+  assert.ok(!review.includes('The writer changed no files'), review);
+});
+
+test('a writer that commits its own work, leaving the copy clean, is not parked for making no changes', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ write: 'a.txt', commit: 'mine' }, { write: 'b.txt', commit: 'mine too' }]);
+  scriptAgent(root, 'fr', [{ say: 'VERDICT: pass' }, { say: 'VERDICT: pass' }]);
+  const s0 = await createSprint(root, draft([T()]), { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, (x) => ['pr-open', 'parked'].includes(x.tickets[0].state));
+  assert.equal(s.tickets[0].state, 'pr-open', s.tickets[0].reason);
+  assert.equal(jobsBy(root, 'reviewer').length, 2, 'each task went to review');
 });

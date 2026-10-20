@@ -33,9 +33,10 @@ test('a ticket may be drafted without a plan: its writer plans it, and its revie
   assert.deepEqual(d.tickets[1].after, []);
   assert.deepEqual(sprintSummary(root, d).tickets[0], {
     key: 'ABC-14', title: 'Export to CSV', state: 'pending', task: 0, of: 0, phase: null, agent: 'fa', reason: null, findings: null, pr: null, reviews: 0,
-    latest: null, tasks: [], canRetry: false, giveTo: null, canStop: false,
+    latest: null, tasks: [], canRetry: false, giveTo: null, foreignCommits: null, canSync: false, canStop: false,
     plan: null, writer: 'fa', reviewer: 'fr', canAssignPlan: true, after: [], waitingOn: [], slot: null,
-    proposed: null, canApprove: false, canOneTask: false, canRevise: false,
+    proposed: null, attention: null, attentionMore: 0, canApprove: false, canOneTask: false, canRevise: false,
+    notes: [], noteCount: 0, canNote: true, canAccept: false, canEvidence: false, testsWhere: null, agentLeft: false,
   });
   const byDefault = await draftSprint(root, { name: 'x', agent: 'fb', reviewer: 'fr', tickets: [P({ key: 'ABC-15', title: 'Import', agent: undefined, reviewer: undefined })] }, { cwd: w.repo });
   assert.deepEqual([byDefault.tickets[0].agent, byDefault.tickets[0].reviewer], ['fb', 'fr'], 'the sprint\'s writer and reviewer stand in');
@@ -117,4 +118,11 @@ test('a plan-less ticket with only its title to plan from gets a plain note in t
   assert.equal((await cli(root, ['sprint', 'start', '--id', r.body.sprint.id])).code, 0);
   const full = await cli(root, ['sprint', 'draft', '--json', '-'], { stdin: JSON.stringify({ name: 'w', tickets: [P({ key: 'SMK-18', title: 'Last' })] }), cwd: w.repo });
   assert.deepEqual(full.body.notes, []);
+});
+
+
+test('a draft warns when agents may run a deploy tool with any arguments in its repo', () => {
+  const notes = draftNotes({ project: 'p', tickets: [], proposed: { commands: ['gh'] } }, { repoCommands: { p: ['supabase', 'npm', 'npx.cmd'] }, repoCheck: { p: 'npm test' } });
+  assert.deepEqual(notes, ['Agents may run supabase, npx.cmd, gh in this repo with any arguments, production commands (deploys, deletes) included. Tell the person before Start. Plans that name such a command wait for their explicit say-so at approval, but a writer could still run one its plan never named.']);
+  assert.deepEqual(draftNotes({ project: 'p', tickets: [] }, { repoCommands: { p: ['npm', 'dotnet'] }, repoCheck: { p: 'npm test' } }), []);
 });

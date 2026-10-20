@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { PodiumError } from './errors.js';
 
 // Characters cmd.exe would interpret even inside double quotes, plus newlines.
@@ -45,17 +45,29 @@ export function commandLine(command, args, platform = process.platform, env = pr
   return { file: process.env.ComSpec || 'cmd.exe', argv: ['/d', '/s', '/c', `"${parts.join(' ')}"`], verbatim: true };
 }
 
-export function killTree(pid, platform = process.platform) {
-  if (!pid) return;
+// taskkill's answer when the process has already ended.
+const NO_SUCH_PROCESS = 128;
+const TASKKILL_MS = 30_000;
+const stopItself = (pid) => { try { process.kill(pid); } catch { /* already gone */ } };
+
+// Stop a process and everything it started. On Windows that is taskkill /T, whose answer is awaited: some sandboxes
+// refuse it ("Access denied": it reads the process tree through WMI), and then `refused` stops what it can, by default
+// the process alone (it gets the pid and what taskkill said); what that process started may still be running. Returns
+// whether the tree was stopped (or had already ended). run is a test seam.
+export function killTree(pid, platform = process.platform, { refused = stopItself, run = spawnSync } = {}) {
+  if (!pid) return true;
   if (platform === 'win32') {
-    spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-    return;
+    const r = run('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true, encoding: 'utf8', timeout: TASKKILL_MS });
+    if (r.status === 0 || r.status === NO_SUCH_PROCESS) return true;
+    refused(pid, String(r.error?.message || r.stderr || r.stdout || `taskkill exited with ${r.status}`).trim());
+    return false;
   }
   try {
     process.kill(-pid, 'SIGTERM'); // whole process group (detached runners lead their own group)
   } catch {
     try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
   }
+  return true;
 }
 
 // A command Podium may stop at a time limit, with whatever it started (a transport, a credential helper, gh's git): on
@@ -63,11 +75,12 @@ export function killTree(pid, platform = process.platform) {
 export const ownGroup = (platform = process.platform) => (platform === 'win32' ? {} : { detached: true });
 
 // Stop a command started with ownGroup, and everything it started, at once: it is past its time limit, so nothing is
-// left to wait for. kill is a test seam.
-export function killGroup(pid, { platform = process.platform, kill = (p, sig) => process.kill(p, sig) } = {}) {
+// left to wait for. On Windows a refused tree stop calls `refused` (see killTree): callers pass one that stops their own
+// child through its handle. kill is a test seam.
+export function killGroup(pid, { platform = process.platform, kill = (p, sig) => process.kill(p, sig), refused } = {}) {
   if (!pid) return;
   if (platform === 'win32') {
-    killTree(pid, platform);
+    killTree(pid, platform, refused ? { refused } : {});
     return;
   }
   try {
@@ -77,7 +90,8 @@ export function killGroup(pid, { platform = process.platform, kill = (p, sig) =>
   }
 }
 
-export function runCaptured(command, args, { cwd, input, timeoutMs = 30_000, env } = {}) {
+// stopTree is a test seam.
+export function runCaptured(command, args, { cwd, input, timeoutMs = 30_000, env, stopTree = killGroup } = {}) {
   return new Promise((resolve) => {
     const childEnv = env ? { ...process.env, ...env } : process.env;
     let line;
@@ -100,10 +114,13 @@ export function runCaptured(command, args, { cwd, input, timeoutMs = 30_000, env
     child.stdout.setEncoding('utf8').on('data', (d) => { stdout += d; });
     child.stderr.setEncoding('utf8').on('data', (d) => { stderr += d; });
     // Past the time limit the whole tree is stopped, and the answer comes at once: a helper the command started may hold
-    // its output open long after (as in Podium's git helper).
+    // its output open long after (as in Podium's git helper, or anything left running where the tree stop is refused), so
+    // the output pipes are let go too, or they would keep the caller's process alive until that helper ends.
     const timer = setTimeout(() => {
       timedOut = true;
-      killGroup(child.pid);
+      stopTree(child.pid, { refused: () => child.kill() });
+      child.stdout.destroy();
+      child.stderr.destroy();
       resolve({ code: -1, stdout, stderr, timedOut });
     }, timeoutMs);
     child.on('error', (e) => { clearTimeout(timer); resolve({ code: -1, stdout, stderr: stderr + e.message, timedOut, error: e }); });

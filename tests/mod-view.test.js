@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { jobState, jobLine, statusText, newlyFinished, detailLines, finishedMessage, committedText, shorten, duration, laneOf, toneOf, lanes, clock, elapsedText, doneText, parseLive, quietText, isQuiet, askText, paletteName, readiness, same, threads, organise, checkRows, sizeText, removalText, isPrEvent, finishedHeadline, sprintStepLine, isFoldOpen, foldsLeaving, accessWord, prChecks, prSub, attentionLine, jobStatusLine, workingRowLine, doneRowLine, isFailedTurn, turnItems, jobDetails, fromAnotherChat, andList, turnLabel, sprintStatusLine, ticketState, ticketStatusLine, whoLine, optionsLine, agentState, agentLine, agentNeedsFix, setupSummary, instructionsSummary, storageSummary, limitsSummary, accessLine, moreSummary, sprintTone, ticketTone, finishedTone, jobTone, REPLY_RULE, isFinishedSprint, finishedSprintTone, finishedSprintLine, sprintWorkingLine, isSprintMine, finishedSprints, FINISHED_SPRINTS, FROM_OTHER_CHAT, isOpenSprint, olderSprintsLine } from '../mod/view.js';
+import { jobState, jobLine, statusText, newlyFinished, detailLines, finishedMessage, committedText, shorten, duration, laneOf, toneOf, lanes, clock, elapsedText, doneText, parseLive, quietText, isQuiet, askText, paletteName, readiness, same, threads, organise, checkRows, sizeText, removalText, isPrEvent, finishedHeadline, sprintStepLine, isFoldOpen, foldsLeaving, accessWord, prChecks, prSub, attentionLine, jobStatusLine, workingRowLine, doneRowLine, isFailedTurn, turnItems, jobDetails, fromAnotherChat, andList, turnLabel, sprintStatusLine, ticketState, ticketStatusLine, whoLine, optionsLine, agentState, agentLine, agentNeedsFix, setupSummary, instructionsSummary, storageSummary, limitsSummary, accessLine, moreSummary, sprintTone, ticketTone, finishedTone, jobTone, REPLY_RULE, jobHandOver, newsHandOver, sprintNewsHeadline, isFinishedSprint, finishedSprintTone, finishedSprintLine, sprintWorkingLine, isSprintMine, finishedSprints, FINISHED_SPRINTS, FROM_OTHER_CHAT, isOpenSprint, olderSprintsLine, attentionHead, ackQuestion, ackUnseen, OTHER_CHATS_MS, ciWords } from '../mod/view.js';
+import { OTHER_CHATS_MS as ENGINE_OTHER_CHATS_MS } from '../engine/delivery.js';
 
 const NOW = Date.parse('2026-10-05T12:00:00Z');
 const job = (over = {}) => ({
@@ -35,6 +36,26 @@ test('newlyFinished picks undelivered finished jobs only', () => {
   assert.deepEqual(newlyFinished(list).map((j) => j.id), ['a', 'd']);
 });
 
+// The engine refuses these to any chat but their own; the mod doesn't ask, so an old backlog costs no claim per job.
+test('newlyFinished leaves out another chat\'s notice past the hour, and the pane still lists it', () => {
+  assert.equal(OTHER_CHATS_MS, ENGINE_OTHER_CHATS_MS);
+  const DAY = 86_400_000;
+  const ended = (agoMs, over) => job({ status: 'done', endedAt: new Date(NOW - agoMs).toISOString(), ...over });
+  const list = [
+    ended(DAY, { id: 'mine', origin: { session: 'me' } }),
+    ended(DAY, { id: 'theirs', origin: { session: 'other' } }),
+    ended(10 * 60_000, { id: 'fresh', origin: { session: 'other' } }),
+    ended(DAY, { id: 'nobody', origin: null }),
+    ended(DAY, { id: 'step', origin: { session: 'other' }, sprint: { id: 's1', ticket: 'ABC-1', task: 1, role: 'author' } }),
+    ended(DAY, { id: 'pr', status: 'in-review', origin: { session: 'other' }, notifiedAt: new Date(NOW - 60_000).toISOString() }),
+  ];
+  assert.deepEqual(newlyFinished(list, { session: 'me', now: NOW }).map((j) => j.id), ['mine', 'fresh', 'step', 'pr']);
+  // Without a chat id the engine decides each.
+  assert.equal(newlyFinished(list, { now: NOW }).length, 6);
+  const out = organise(threads(list.filter((j) => !j.sprint)), { session: 'me', now: NOW });
+  assert.ok(out.others.some((t) => t.latest.id === 'theirs'));
+});
+
 test('detail line and finished message', () => {
   const done = job({ status: 'needs-review', permission: 'edit-worktree', endedAt: '2026-10-05T12:03:00Z' });
   assert.equal(detailLines(done), 'Ticket ABC-4 · took 7 min · Codex could edit files in a separate copy');
@@ -45,6 +66,21 @@ test('detail line and finished message', () => {
   assert.match(msg, /Job j1\./);
   assert.match(finishedMessage(job({ status: 'failed', error: 'Codex exited with code 3.' }), null), /Codex exited with code 3\./);
   assert.equal(detailLines(job({ ticket: 'NO-TICKET', startedAt: null })), 'No ticket · Codex could only read files');
+});
+
+test('a hand-over\'s hidden notes carry the reply rule; the visible details, used only when the row can\'t be added, never do', () => {
+  const done = job({ status: 'needs-review', permission: 'edit-worktree', endedAt: '2026-10-05T12:03:00Z' });
+  const news = [{ id: 's1:1', sprint: 'Oct week 2', text: 'ABC-12 (Payouts) needs you: Review failed twice on task 1\nStill broken.' }];
+  for (const [what, h, headline, said] of [
+    ['a job', jobHandOver(done, 'All fine.'), finishedHeadline(done), 'All fine.'],
+    ['sprint news', newsHandOver(news), sprintNewsHeadline(news), 'Still broken.'],
+  ]) {
+    assert.equal(h.headline, headline, what);
+    assert.ok(h.notes.endsWith(REPLY_RULE), what);
+    assert.ok(!h.details.includes('Do not repeat their line'), what);
+    assert.ok(h.notes.includes(said) && h.details.includes(said), what);
+    assert.equal(h.details, h.notes.slice(0, -REPLY_RULE.length).trimEnd(), `${what}: the same note, less the rule`);
+  }
 });
 
 test('helpers', () => {
@@ -265,6 +301,18 @@ test('checkRows reads the doctor report and the agents in plain words', () => {
   assert.match(bad.find((r) => /No agents found/.test(r.text)).text, /install/);
   assert.equal(bad.find((r) => /told when jobs finish/.test(r.text)).ok, false);
   assert.match(checkRows(REPORT, null)[2].text, /Looking for agents/);
+});
+
+test('checkRows warns only when the copies folder path has a space or %', () => {
+  const agentsFound = [{ name: 'codex', label: 'Codex', installed: true, version: '0.1' }];
+  const warned = checkRows({ ...REPORT, copies: { root: '/Users/me/My Copies', ok: false } }, agentsFound);
+  const row = warned.find((r) => /copies/.test(r.text));
+  assert.equal(row.ok, false);
+  assert.match(row.text, /space or %/);
+  assert.match(row.text, /tests fail/);
+  assert.match(row.text, /worktreeRoot/);
+  assert.equal(checkRows(REPORT, agentsFound).some((r) => /copies/.test(r.text)), false);
+  assert.equal(checkRows({ ...REPORT, copies: { root: '/Users/me/copies', ok: true } }, agentsFound).some((r) => /copies/.test(r.text)), false);
 });
 
 test('sizeText and removalText', () => {
@@ -857,4 +905,77 @@ test('finishedSprints splits finished sprints into this chat\'s and other chats\
 test('the older finished sprints a fold leaves out are counted in one dim line', () => {
   assert.equal(olderSprintsLine(2), '2 older sprints are not shown here; ask Claude for them.');
   assert.equal(olderSprintsLine(1), '1 older sprint is not shown here; ask Claude for it.');
+});
+
+test('a ticket stopped on its tests says where they ran and the ways on; the accept form says who reviews next', async () => {
+  const { testsParkHint, acceptLine } = await import('../mod/view.js');
+  assert.match(testsParkHint({ testsWhere: 'sandbox', agent: 'codex' }), /^These ran in Codex's sandbox, not on this machine\. If the result is fine, accept it and the task goes to its review; or set a task test \(Settings → This repo\)/);
+  assert.match(testsParkHint({ testsWhere: 'host', agent: 'codex' }), /^Podium ran these on this machine\. Retry gives the writer the log/);
+  assert.equal(acceptLine('claude'), 'Claude reviews it next, told what you said and not to fail it for these results.');
+  assert.equal(acceptLine(null), 'Its reviewer reviews it next, told what you said and not to fail it for these results.', 'a card without its tasks names none');
+});
+
+test('the evidence form says who reviews the task again and what they do with it', async () => {
+  const { evidenceLine } = await import('../mod/view.js');
+  assert.equal(evidenceLine('codex'), "Codex reviews it again, weighing this before failing it for tests it couldn't run.");
+  assert.equal(evidenceLine(null), "Its reviewer reviews it again, weighing this before failing it for tests it couldn't run.");
+});
+
+test('a plan that runs production commands says it needs your attention wherever "plan ready" is said', () => {
+  const t = { key: 'ABC-1', title: 'X', state: 'plan-ready', attention: [{ n: 2, command: 'git push' }] };
+  assert.equal(ticketStatusLine(t), 'Plan ready · check it, then approve · needs your attention');
+  assert.equal(ticketState(t), 'plan ready · needs your attention');
+  assert.equal(ticketState({ ...t, attention: null, attentionCount: 2 }), 'plan ready · needs your attention');
+  assert.equal(ticketStatusLine({ ...t, attention: null }), 'Plan ready · check it, then approve');
+  assert.equal(ticketState({ ...t, state: 'no-tasks' }), 'no tasks found in the plan · needs your attention');
+  const [item] = turnItems({ needs: [], done: [] }, [{ sprint: 's1', sprintName: 'Oct', key: 'ABC-1', title: 'X', state: 'plan-ready', reason: '', attentionCount: 1 }]);
+  assert.equal(item.reason, 'Oct · plan ready · needs your attention');
+  assert.equal(attentionHead(1), 'Needs your attention: this plan runs a production command');
+  assert.equal(attentionHead(3), 'Needs your attention: this plan runs 3 production commands');
+  assert.equal(ackQuestion(1), 'The agent will run that command as the plan says. Approve the plan anyway?');
+  assert.equal(ackQuestion(2, true), 'The agent will run those commands as the plan says. Run the plan as one task anyway?');
+  assert.equal(ackUnseen(1), 'Its production command is not shown here. Ask Claude to list it, and approve there once you agree.');
+  assert.equal(ackUnseen(3), 'Not all of its 3 production commands are shown here. Ask Claude to list them, and approve there once you agree.');
+});
+
+test('a ticket whose plan left checks to the PR\'s CI says how that CI stands', () => {
+  assert.equal(ciWords(tk()), '');
+  assert.equal(ciWords(tk({ ciState: 'waiting' })), ' · CI running');
+  assert.equal(ciWords(tk({ ciState: 'passed' })), ' · CI passed');
+  assert.equal(ciWords(tk({ ciState: 'failed' })), ' · CI failed');
+  assert.equal(ciWords(tk({ ciState: 'none' })), ' · no CI ran');
+  assert.equal(ciWords(tk({ ciState: 'other' })), '');
+  // A whole sprint's ticket (an open board or ticket screen) carries the summary's ci, not ciState.
+  assert.equal(ciWords(tk({ ci: { state: 'passed', checks: ['x'], failing: [] } })), ' · CI passed');
+  assert.equal(ticketState(tk({ state: 'pr-open', pr: { number: 21 }, ci: { state: 'failed', checks: ['x'], failing: ['t'] } })), 'PR #21 open · CI failed');
+  const open = tk({ state: 'pr-open', pr: { number: 20 }, ciState: 'failed' });
+  assert.equal(ticketState(open), 'PR #20 open · CI failed');
+  assert.equal(ticketStatusLine(open), 'PR #20 open · CI failed');
+  assert.equal(ticketState(tk({ state: 'pr-open', pr: { number: 20 } })), 'PR #20 open', 'unchanged without CI checks');
+});
+
+test('a ticket parked on a locked file says what to release and how to retry; anything else reads ordinary', async () => {
+  const { checkpointLockHint, ticketRetryLabel } = await import('../mod/view.js');
+  const lock = { file: '.review-tmp/VBCSCompiler/x.dll', hint: null, stashBefore: null, stashAfter: 'abc1234' };
+  const parked = { key: 'ABC-12', title: 'Payouts', state: 'parked', checkpointLock: lock };
+  const hint = checkpointLockHint(parked);
+  assert.match(hint, /\.review-tmp\/VBCSCompiler\/x\.dll is still open in a program/);
+  assert.match(hint, /Close the program holding the file, then press I've released it — Retry/);
+  assert.match(hint, /The ticket's copy and any stash Git made have been kept/);
+  assert.doesNotMatch(hint, /dotnet build-server shutdown/);
+  assert.equal(ticketRetryLabel(parked), "I've released it — Retry");
+  // The .NET hint names the compiler-server command, and nothing else does.
+  const dotnet = { ...parked, checkpointLock: { ...lock, hint: 'dotnet' } };
+  assert.match(checkpointLockHint(dotnet), /dotnet build-server shutdown in this ticket's copy/);
+  assert.equal(ticketRetryLabel(dotnet), "I've released it — Retry");
+  // Older tickets without the field read ordinary.
+  assert.equal(checkpointLockHint({ key: 'ABC-12', title: 'Payouts', state: 'parked' }), null);
+  assert.equal(ticketRetryLabel({ key: 'ABC-12', title: 'Payouts', state: 'parked' }), 'Retry');
+  // So does a ticket that has moved on, even with a stale field (Retry clears it).
+  for (const state of ['waiting', 'running', 'pending']) {
+    assert.equal(checkpointLockHint({ ...parked, state }), null, state);
+    assert.equal(ticketRetryLabel({ ...parked, state }), 'Retry', state);
+  }
+  // A lock without a usable filename still guides, without naming a guess.
+  assert.match(checkpointLockHint({ ...parked, checkpointLock: { hint: null } }), /^an unidentified file is still open in a program/);
 });

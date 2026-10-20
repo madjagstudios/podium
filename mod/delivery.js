@@ -8,25 +8,72 @@
 // leaves the work to be tried again).
 // A row or prompt a hook refused or dropped on purpose still counts as handled: a `deny` from append is a
 // plugin saying no to the row, so the details are not forced into the chat.
-export async function handOver({ append, submit, headline, details }) {
+// With `arrived` (an `arrivals()` registry's expect), the message also counts as in once a turn starts holding the
+// headline, which opens the message either way: see arrivals.
+export async function handOver({ append, submit, headline, details, arrived }) {
   let hidden = true;
   try {
     await append();
   } catch {
     hidden = false;
   }
+  const watch = arrived ? arrived(headline) : null;
   try {
-    await submit(hidden ? headline : `${headline}\n\n${details}`);
+    const sent = submit(hidden ? headline : `${headline}\n\n${details}`);
+    await (watch ? Promise.race([sent, watch.seen]) : sent);
   } catch {
     return false;
+  } finally {
+    watch?.cancel();
   }
   return true;
 }
 
+// Prompts that waited behind a busy turn can enter together: the host starts one turn holding every waiting text, one
+// per line, and settles only the last one's submit (the others never settle). So a hand-over waiting on its submit
+// also ends once a turn starts whose text holds its headline (turnStarted, from the mod's turn.start hook): the
+// message is in then, never before. Identical headlines (three reviews of one PR) are counted, oldest first, so a turn
+// holding one confirms one.
+export function arrivals() {
+  const waiting = [];
+  const drop = (entry) => {
+    const i = waiting.indexOf(entry);
+    if (i >= 0) waiting.splice(i, 1);
+  };
+  return {
+    expect(headline) {
+      const entry = { headline };
+      entry.seen = new Promise((resolve) => { entry.settle = resolve; });
+      waiting.push(entry);
+      return { seen: entry.seen, cancel: () => drop(entry) };
+    },
+    turnStarted(text) {
+      const left = new Map();
+      for (const entry of [...waiting]) {
+        if (!left.has(entry.headline)) left.set(entry.headline, occurrences(String(text ?? ''), entry.headline));
+        const n = left.get(entry.headline);
+        if (n < 1) continue;
+        left.set(entry.headline, n - 1);
+        drop(entry);
+        entry.settle(true);
+      }
+    },
+  };
+}
+
+function occurrences(text, part) {
+  if (!part) return 0;
+  let n = 0;
+  for (let i = text.indexOf(part); i !== -1; i = text.indexOf(part, i + part.length)) n += 1;
+  return n;
+}
+
 // One pass of sprint news: claim, hand over, then mark delivered, as for jobs. The mod keeps three things across
 // passes: `announced`, ids handed over but not yet marked (marked first next time, never announced twice); `inFlight`,
-// ids being sent now (a send can outlast the 2-minute claim, so a later pass skips them; a failed send clears them);
-// and `busy` ({ on }), so only one pass runs at a time. mark(ids) answers { failed }, or null when the call failed.
+// ids being sent now (a later pass skips them; a failed send clears them); and `busy` ({ on }), so only one pass runs at a
+// time. mark(ids) answers { failed }, or null when the call failed. With `sleep` and `refresh(ids)`, the claims are renewed
+// while the send waits (keepFresh), so a send that outlasts the 2-minute claim never lets another pass, in this mod or a
+// reloaded one, take the news and say it again.
 export async function sprintNewsPass({ busy = { on: false }, ...deps }) {
   if (busy.on) return;
   busy.on = true;
@@ -37,7 +84,7 @@ export async function sprintNewsPass({ busy = { on: false }, ...deps }) {
   }
 }
 
-async function newsPass({ announced, inFlight, hasNews, claim, tellClaude, send, toast, mark }) {
+async function newsPass({ announced, inFlight, hasNews, claim, tellClaude, send, toast, mark, sleep, refresh }) {
   const confirm = async (ids) => {
     if (!ids.length) return;
     const r = await mark(ids);
@@ -55,7 +102,9 @@ async function newsPass({ announced, inFlight, hasNews, claim, tellClaude, send,
   for (const m of fresh) inFlight.add(m.id);
   try {
     if (await tellClaude()) {
-      if (!(await send(fresh))) return; // nothing went in: the claim expires and it is tried again
+      const ids = fresh.map((m) => m.id);
+      const sent = sleep && refresh ? await keepFresh(() => send(fresh), { sleep, refresh: () => refresh(ids) }) : await send(fresh);
+      if (!sent) return; // nothing went in: the claim expires and it is tried again
     } else {
       toast(fresh); // Claude isn't told: the person still sees it, as finished jobs do
     }

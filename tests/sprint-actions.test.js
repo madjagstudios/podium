@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Writable } from 'node:stream';
-import { createSprint, tick, locked, loadSprint, saveSprint, setPaused, retryTicket, assignTask, claimMessages, markMessages, sprintSummary, CLAIM_MS } from '../engine/sprint.js';
+import { createSprint, tick, locked, loadSprint, saveSprint, setPaused, retryTicket, assignTask, claimMessages, markMessages, refreshMessages, writeRenewal, adoptSprint, sprintSummary, setReadHook, CLAIM_MS } from '../engine/sprint.js';
 import { listJobDirs, readJob } from '../engine/store.js';
 import { main } from '../engine/cli.js';
 import { setSetting } from '../engine/settings.js';
@@ -159,6 +159,104 @@ test('messages go to the sprint\'s chat once, and never to another chat', async 
   assert.deepEqual((await claimMessages(root, 'chat-1', { now: now + 100 * 60_000 })).messages, []);
 });
 
+test('a chat sending sprint news keeps its claim alive for as long as the send takes; no other chat can renew it', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ err: 'boom', exit: 3 }]);
+  scriptAgent(root, 'fr', []);
+  const s0 = await createSprint(root, { name: 'x', tickets: [T()] }, { cwd: w.repo, session: 'chat-1' });
+  await run(root, s0.id, w.env, (s) => s.tickets[0].state === 'parked');
+  const now = Date.now();
+  const [mine] = (await claimMessages(root, 'chat-1', { now })).messages;
+  assert.deepEqual(await refreshMessages(root, 'chat-2', [mine.id], { now: now + CLAIM_MS - 1000 }), { refreshed: 0 }, 'not its claim');
+  assert.deepEqual(await refreshMessages(root, 'chat-1', [mine.id], { now: now + CLAIM_MS - 1000 }), { refreshed: 1 });
+  assert.deepEqual((await claimMessages(root, 'chat-1', { now: now + CLAIM_MS + 1000 })).messages, [], 'renewed: still claimed past the first two minutes');
+  assert.equal((await claimMessages(root, 'chat-1', { now: now + 2 * CLAIM_MS })).messages.length, 1, 'a claim no one renews still expires');
+  await markMessages(root, [mine.id]);
+  assert.deepEqual(await refreshMessages(root, 'chat-1', [mine.id], { now: now + 3 * CLAIM_MS }), { refreshed: 0 }, 'a delivered message has no claim to renew');
+  let out = '';
+  const stdout = new Writable({ write(c, _e, cb) { out += c; cb(); } });
+  await main(['sprint', 'refresh', '--session', 'chat-1', '--ids', `${mine.id},${s0.id}:9`], { stdout, env: { ...process.env, PODIUM_DATA_DIR: root } });
+  assert.deepEqual(JSON.parse(out), { refreshed: 0 });
+});
+
+test('a claim is renewed even while a tick holds the sprint lock, and a sprint taken into another chat stops counting the old chat\'s renewals', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ err: 'boom', exit: 3 }]);
+  scriptAgent(root, 'fr', []);
+  const s0 = await createSprint(root, { name: 'x', tickets: [T()] }, { cwd: w.repo, session: 'chat-1' });
+  await run(root, s0.id, w.env, (s) => s.tickets[0].state === 'parked');
+  const now = Date.now();
+  const [mine] = (await claimMessages(root, 'chat-1', { now })).messages;
+  // A tick holding the lock for longer than a claim lasts: the renewal never waits for it.
+  await locked(root, s0.id, async () => {
+    assert.deepEqual(refreshMessages(root, 'chat-1', [mine.id], { now: now + CLAIM_MS - 1000 }), { refreshed: 1 });
+  });
+  assert.deepEqual((await claimMessages(root, 'chat-1', { now: now + CLAIM_MS + 1000 })).messages, [], 'renewed while the lock was held');
+  // "Take them here": the sprint is chat-2's now, so chat-1's renewal no longer holds the news back from it.
+  await adoptSprint(root, s0.id, 'chat-2');
+  assert.deepEqual(refreshMessages(root, 'chat-1', [mine.id], { now: now + CLAIM_MS + 2000 }), { refreshed: 0 });
+  const taken = (await claimMessages(root, 'chat-2', { now: now + CLAIM_MS + 3000 })).messages;
+  assert.deepEqual(taken.map((m) => m.id), [mine.id]);
+  // chat-2 is sending it now and renews; a renewal from chat-1 that read the sprint before it moved lands late. It never
+  // replaces chat-2's, so chat-2's claim still holds past its first two minutes.
+  assert.deepEqual(refreshMessages(root, 'chat-2', [mine.id], { now: now + 2 * CLAIM_MS }), { refreshed: 1 });
+  writeRenewal(root, s0.id, mine.id.split(':').pop(), 'chat-1', now + 2 * CLAIM_MS + 500);
+  assert.deepEqual((await claimMessages(root, 'chat-2', { now: now + 2 * CLAIM_MS + 60_000 })).messages, [], 'still chat-2\'s claim');
+});
+
+test('two copies of the mod in one chat never renew each other\'s claims, and ids that are not a sprint message touch no path', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ err: 'boom', exit: 3 }]);
+  scriptAgent(root, 'fr', []);
+  const s0 = await createSprint(root, { name: 'x', tickets: [T()] }, { cwd: w.repo, session: 'chat-1' });
+  await run(root, s0.id, w.env, (s) => s.tickets[0].state === 'parked');
+  const now = Date.now();
+  const [mine] = (await claimMessages(root, 'chat-1', { now, instance: 'copy-a' })).messages;
+  const mid = mine.id.split(':').pop();
+  assert.deepEqual(refreshMessages(root, 'chat-1', [mine.id], { now: now + 1000, instance: 'copy-b' }), { refreshed: 0 }, 'not copy-b\'s claim');
+  // copy-a stopped renewing (it was reloaded away): its claim lapses and copy-b takes the news.
+  const taken = (await claimMessages(root, 'chat-1', { now: now + CLAIM_MS + 1000, instance: 'copy-b' })).messages;
+  assert.deepEqual(taken.map((m) => m.id), [mine.id]);
+  // A renewal from copy-a that lands late counts for nothing: copy-b's claim lapses on its own clock.
+  writeRenewal(root, s0.id, mid, 'copy-a', now + 2 * CLAIM_MS);
+  assert.equal((await claimMessages(root, 'chat-1', { now: now + 2 * CLAIM_MS + 2000, instance: 'copy-c' })).messages.length, 1);
+  // Ids shaped to climb out of the sprint's folder are never used as paths.
+  const folder = path.join(root, 'sprints', s0.id);
+  assert.deepEqual(await markMessages(root, [`${s0.id}:..`, '..:../../..', `${s0.id}:1/../..`]), { marked: 0, failed: [] });
+  assert.deepEqual(refreshMessages(root, 'chat-1', [`${s0.id}:..`, '..:..'], { instance: 'copy-c' }), { refreshed: 0 });
+  assert.ok(fs.existsSync(folder) && fs.existsSync(root));
+  assert.equal(loadSprint(root, s0.id).messages.length > 0, true);
+});
+
+test('a damaged renewal never stops news being claimed, and renewals go on while the sprint can\'t be read', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ err: 'boom', exit: 3 }]);
+  scriptAgent(root, 'fr', []);
+  const s0 = await createSprint(root, { name: 'x', tickets: [T()] }, { cwd: w.repo, session: 'chat-1' });
+  await run(root, s0.id, w.env, (s) => s.tickets[0].state === 'parked');
+  const now = Date.now();
+  const [mine] = (await claimMessages(root, 'chat-1', { now, instance: 'copy-a' })).messages;
+  // Its state can't be read for a while: copy-a's renewal is written all the same.
+  setReadHook(() => { throw Object.assign(new Error('busy disk'), { code: 'EBUSY' }); });
+  try {
+    assert.deepEqual(refreshMessages(root, 'chat-1', [mine.id], { now: now + CLAIM_MS - 1000, instance: 'copy-a' }), { refreshed: 1 });
+  } finally {
+    setReadHook(null);
+  }
+  assert.deepEqual((await claimMessages(root, 'chat-1', { now: now + CLAIM_MS + 1000, instance: 'copy-b' })).messages, [], 'still copy-a\'s');
+  // The renewal file is damaged: it renews nothing, and claiming carries on.
+  const dir = path.join(root, 'sprints', s0.id, 'claims', mine.id.split(':').pop());
+  for (const f of fs.readdirSync(dir)) fs.writeFileSync(path.join(dir, f), '{ half written');
+  assert.deepEqual((await claimMessages(root, 'chat-1', { now: now + CLAIM_MS + 1500, instance: 'copy-c' })).messages.length, 1);
+  // Nor one that reads as JSON but isn't a renewal.
+  const [again] = (await claimMessages(root, 'chat-1', { now: now + 3 * CLAIM_MS, instance: 'copy-b' })).messages;
+  for (const f of fs.readdirSync(dir)) fs.writeFileSync(path.join(dir, f), JSON.stringify({ by: 'copy-b', at: { toString: null } }));
+  writeRenewal(root, s0.id, again.id.split(':').pop(), 'copy-b', now + 3 * CLAIM_MS);
+  for (const f of fs.readdirSync(dir)) fs.writeFileSync(path.join(dir, f), JSON.stringify({ by: 'copy-b', at: { toString: null } }));
+  const taken = (await claimMessages(root, 'chat-1', { now: now + 4 * CLAIM_MS + 1000, instance: 'copy-d' })).messages;
+  assert.deepEqual(taken.map((m) => m.id), [mine.id]);
+});
+
 test('the inbox takes only this project\'s sprint news with --here, and the summary counts news', async () => {
   const { root, w } = sprintWorld();
   scriptAgent(root, 'fa', [{ err: 'boom', exit: 3 }]);
@@ -227,6 +325,14 @@ test('markMessages for a sprint that no longer exists marks nothing and fails no
   assert.deepEqual(await markMessages(root, ['gone-sprint:1']), { marked: 0, failed: [] });
 });
 
+// Every step the sprint ran, oldest first, with the end of its output: shown when a park's words are not the expected ones.
+const trail = (root) => listJobDirs(root).map((d) => {
+  const j = readJob(d);
+  let out = '';
+  try { out = fs.readFileSync(path.join(d, 'output.md'), 'utf8').slice(-240).replace(/\s+/g, ' '); } catch { /* none */ }
+  return `${j.createdAt} ${j.sprint?.role} ${j.agent} ${j.status} exit=${j.exitCode} :: ${out}`;
+}).sort().join('\n');
+
 test('after a retry the park words say "again", counting retries, and a pass starts the count over', async () => {
   const { root, w } = sprintWorld();
   scriptAgent(root, 'fa', [{ write: 'a.txt' }, { write: 'a2.txt' }, { write: 'a3.txt' }, { write: 'a4.txt' }, { write: 'b.txt' }]);
@@ -240,7 +346,7 @@ test('after a retry the park words say "again", counting retries, and a pass sta
   assert.equal(second.tickets[0].reason, "The reviewer didn't give a verdict on task 1 again after a retry");
   await retryTicket(root, s0.id, 'ABC-11');
   const third = await run(root, s0.id, w.env, (s) => s.tickets[0].state === 'parked');
-  assert.equal(third.tickets[0].reason, "The reviewer didn't give a verdict on task 1 again after 2 retries");
+  assert.equal(third.tickets[0].reason, "The reviewer didn't give a verdict on task 1 again after 2 retries", trail(root));
   assert.equal(third.tickets[0].retries, 2);
   await retryTicket(root, s0.id, 'ABC-11');
   const passed = await run(root, s0.id, w.env, (s) => s.tickets[0].task === 1);
@@ -258,7 +364,7 @@ test('a failed review after two retries says how many', async () => {
   await run(root, s0.id, w.env, (s) => s.tickets[0].state === 'parked');
   await retryTicket(root, s0.id, 'ABC-11');
   const s = await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'parked');
-  assert.equal(s.tickets[0].reason, 'Review failed again on task 1 after 2 retries');
+  assert.equal(s.tickets[0].reason, 'Review failed again on task 1 after 2 retries', trail(root));
 });
 
 test('the retry note says which agent does what, after any override', async () => {

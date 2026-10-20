@@ -71,8 +71,13 @@ export function statusText(jobs) {
   return `🎼 Podium: ${parts.join(' · ')}`;
 }
 
-export function newlyFinished(jobs) {
-  return jobs.filter((j) => !j.delivered && ['done', 'needs-review', 'failed', 'lost', 'in-review', 'merged', 'closed'].includes(j.status));
+// How long another chat may take a plain job's notice; the engine refuses it after that (engine/delivery.js). Those
+// are left out here, so an old backlog costs no claim per job on every refresh. Without a chat id the engine decides each.
+export const OTHER_CHATS_MS = 3_600_000;
+export function newlyFinished(jobs, { session = null, now = Date.now() } = {}) {
+  const tooOld = (j) => Boolean(session) && !j.sprint && j.origin?.session !== session
+    && now - Date.parse(j.notifiedAt ?? j.endedAt ?? j.createdAt) > OTHER_CHATS_MS;
+  return jobs.filter((j) => !j.delivered && ['done', 'needs-review', 'failed', 'lost', 'in-review', 'merged', 'closed'].includes(j.status) && !tooOld(j));
 }
 
 // took: false where the line already says how long it took (the detail card).
@@ -431,6 +436,9 @@ export function checkRows(report, agentList) {
   rows.push(report.tellClaude
     ? { ok: true, text: 'Claude is told when jobs finish' }
     : { ok: false, text: "Claude isn't told when jobs finish: turn it on in Settings" });
+  if (report.copies && report.copies.ok === false) {
+    rows.push({ ok: false, text: "Podium's copies are in a folder whose path has a space or %: some repos' tests fail there. Set a copies folder without spaces (setting worktreeRoot, a full path)." });
+  }
   return rows;
 }
 
@@ -458,6 +466,22 @@ export const REVIEW_WORDS = { APPROVED: 'approved', CHANGES_REQUESTED: 'changes 
 // Safe for anything (a number or an object from malformed sprint data draws as text, never throws).
 const named = (a) => agentLabel(a);
 const isReviewing = (phase) => phase === 'review' || phase === 'fix-review';
+
+// A plan waiting for the person that runs production commands: their lines on the open ticket (attention, and how many
+// more past them, attentionMore), a count on the others (attentionCount). Said beside "plan ready" wherever that is said,
+// and Approve asks first.
+export const flaggedOf = (t) => ((t?.attention?.length ?? 0) + (t?.attentionMore ?? 0)) || (t?.attentionCount ?? 0);
+const withAttention = (t, text) => (flaggedOf(t) ? `${text} · needs your attention` : text);
+export function attentionHead(n) {
+  return `Needs your attention: this plan runs ${n === 1 ? 'a production command' : `${n} production commands`}`;
+}
+// With only their count on this screen (the pane sent a short form of the sprint), the person agrees in the chat instead.
+export function ackUnseen(n) {
+  return `${n === 1 ? 'Its production command is not shown here' : `Not all of its ${n} production commands are shown here`}. Ask Claude to list ${n === 1 ? 'it' : 'them'}, and approve there once you agree.`;
+}
+export function ackQuestion(n, whole = false) {
+  return `The agent will run ${n === 1 ? 'that command' : 'those commands'} as the plan says. ${whole ? 'Run the plan as one task' : 'Approve the plan'} anyway?`;
+}
 const SHIPPED_STATES = new Set(['pr-open', 'merged', 'closed']);
 // A ticket with nothing left to do: its PR is merged or closed, or the person stopped it.
 export const SPRINT_ENDED = new Set(['merged', 'closed', 'stopped']);
@@ -547,15 +571,18 @@ export function sprintRow(t, draft = false) {
   switch (t.state) {
     case 'pending': return t.waitingOn?.length ? `waiting (after ${t.waitingOn.join(', ')})` : slotWords(t) ?? 'waiting to start';
     case 'running':
+      if (t.agentLeft) return `${named(t.agent)}'s runner stopped · waiting for ${named(t.agent)} to finish`;
       if (isPlanning(t.phase)) return `${t.phase === 'revise' ? 'Changing the plan' : 'Writing the plan'} · ${named(t.agent)} working`;
       if (t.phase === 'check') return 'Full check before the PR · running';
+      if (t.phase === 'task-test') return `Task ${t.task}/${t.of} · task test running on this machine`;
+      if (t.phase === 'baseline') return t.baselineOf === 'check' ? 'Full check · running it at the base' : `Task ${t.task}/${t.of} · task test running at the base`;
       if (t.phase === 'check-fix') return `Fixing what the full check found · ${named(t.agent)} working`;
       return `Task ${t.task}/${t.of} · ${named(t.agent)} ${isReviewing(t.phase) ? 'reviewing' : t.phase === 'fix' ? 'fixing' : 'working'}${t.reviews ? ` · reviews ${t.reviews} ✓` : ''}`;
     case 'waiting': return t.reason ?? 'waiting';
     case 'parked': return `✋ ${t.reason}`;
-    case 'plan-ready': return 'Plan ready: approve?';
-    case 'no-tasks': return "✋ Couldn't find tasks in this plan";
-    case 'pr-open': return `PR #${t.pr?.number} open`;
+    case 'plan-ready': return withAttention(t, 'Plan ready: approve?');
+    case 'no-tasks': return withAttention(t, "✋ Couldn't find tasks in this plan");
+    case 'pr-open': return `PR #${t.pr?.number} open${ciWords(t)}`;
     case 'merged': return `✓ PR #${t.pr?.number} merged`;
     case 'closed': return `PR #${t.pr?.number} closed`;
     case 'stopped': return 'stopped';
@@ -566,8 +593,11 @@ export function sprintRow(t, draft = false) {
 // What a running ticket is doing, in a few words (the sprint's headline in the tool's text). The board's status line names
 // running tickets by key only (sprintStatusLine).
 export function doingText(t) {
+  if (t.agentLeft) return `waiting for ${named(t.agent)} on ${t.key} (its runner stopped)`;
   if (isPlanning(t.phase)) return `${named(t.agent)} ${t.phase === 'revise' ? 'changing the plan for' : 'planning'} ${t.key}`;
   if (t.phase === 'check') return `full check on ${t.key}`;
+  if (t.phase === 'task-test') return `task test on ${t.key} task ${t.task}`;
+  if (t.phase === 'baseline') return `${t.baselineOf === 'check' ? 'full check' : 'task test'} at ${t.key}'s base`;
   if (t.phase === 'check-fix') return `${named(t.agent)} fixing ${t.key} for its full check`;
   return `${named(t.agent)} ${isReviewing(t.phase) ? 'reviewing' : 'working on'} ${t.key} task ${t.task}`;
 }
@@ -651,6 +681,12 @@ export function sprintNewsNotes(messages, visible = false) {
     visible ? null : REPLY_RULE,
   ].filter(Boolean).join('\n\n');
 }
+
+// What a hand-over (handOver in delivery.js) carries: the hidden row's notes, the one-line headline, and the details the
+// visible message holds only when the row can't be added. Those are the visible variant: the reply rule speaks of a note
+// the person doesn't see, so it never goes in a message they do.
+export const jobHandOver = (job, summary) => ({ notes: finishedMessage(job, summary), headline: finishedHeadline(job), details: finishedMessage(job, summary, true) });
+export const newsHandOver = (list) => ({ notes: sprintNewsNotes(list), headline: sprintNewsHeadline(list), details: sprintNewsNotes(list, true) });
 
 // ---- Pane clarity ----
 
@@ -763,7 +799,7 @@ export function turnItems(org, tickets = []) {
   }
   for (const x of tickets) {
     const open = { name: 'openTicket', args: [x.sprint, x.key] };
-    const why = x.state === 'plan-ready' ? 'plan ready' : x.state === 'no-tasks' ? 'no tasks found in the plan' : (x.reason || 'needs you');
+    const why = x.state === 'plan-ready' ? withAttention(x, 'plan ready') : x.state === 'no-tasks' ? withAttention(x, 'no tasks found in the plan') : (x.reason || 'needs you');
     items.push({ id: `${x.sprint}-${x.key}`, title: `${x.key} ${x.title}`, open, reason: `${x.sprintName} · ${why}`, label: turnLabel(x.state), act: open });
   }
   return items;
@@ -819,6 +855,14 @@ export function finishedSprintLine(s, now = Date.now()) {
 
 const tasksWord = (n) => `${n} task${n === 1 ? '' : 's'}`;
 
+// A sprint PR whose plan left checks to its CI: how that CI stands, after the PR's number. '' for any other ticket.
+// A ticket sent as a row carries ciState; a whole sprint's ticket carries the summary's ci.
+const CI_WORDS = { waiting: 'CI running', passed: 'CI passed', failed: 'CI failed', none: 'no CI ran' };
+export const ciWords = (t) => {
+  const state = t?.ciState ?? t?.ci?.state ?? '';
+  return Object.hasOwn(CI_WORDS, state) ? ` · ${CI_WORDS[state]}` : '';
+};
+
 // A ticket's row on the board: where it stands, in a few words.
 export function ticketState(t, draft = false) {
   if (draft) {
@@ -828,15 +872,18 @@ export function ticketState(t, draft = false) {
   switch (t.state) {
     case 'pending': return t.waitingOn?.length ? `starts after ${andList(t.waitingOn)}` : slotWords(t) ?? 'waiting to start';
     case 'running':
+      if (t.agentLeft) return `waiting for ${named(t.agent)} to finish (its runner stopped)`;
       if (isPlanning(t.phase)) return `${named(t.agent)} ${t.phase === 'revise' ? 'changing' : 'writing'} the plan`;
       if (t.phase === 'check') return 'running the full check';
+      if (t.phase === 'task-test') return `task ${t.task} of ${t.of} · running the task test`;
+      if (t.phase === 'baseline') return t.baselineOf === 'check' ? 'running the full check at the base' : `task ${t.task} of ${t.of} · running the task test at the base`;
       if (t.phase === 'check-fix') return `${named(t.agent)} fixing what the full check found`;
       return `task ${t.task} of ${t.of} · ${named(t.agent)} ${isReviewing(t.phase) ? 'reviewing' : t.phase === 'fix' ? 'fixing' : 'working'}`;
     case 'waiting': return t.reason ?? 'waiting';
     case 'parked': return 'needs you';
-    case 'plan-ready': return 'plan ready';
-    case 'no-tasks': return 'no tasks found in the plan';
-    case 'pr-open': return `PR #${t.pr?.number} open`;
+    case 'plan-ready': return withAttention(t, 'plan ready');
+    case 'no-tasks': return withAttention(t, 'no tasks found in the plan');
+    case 'pr-open': return `PR #${t.pr?.number} open${ciWords(t)}`;
     case 'merged': return `PR #${t.pr?.number} merged`;
     case 'closed': return `PR #${t.pr?.number} closed`;
     case 'stopped': return 'stopped';
@@ -848,18 +895,26 @@ export function ticketState(t, draft = false) {
 export function ticketStatusLine(t, draft = false) {
   if (draft) return t.of ? `${tasksWord(t.of)} · nothing runs until the sprint starts` : `No plan yet · ${named(t.writer ?? t.agent)} plans it first`;
   switch (t.state) {
-    case 'plan-ready': return 'Plan ready · check it, then approve';
-    case 'no-tasks': return 'No tasks found in the plan · run it as one task, or ask for changes';
+    case 'plan-ready': return withAttention(t, 'Plan ready · check it, then approve');
+    case 'no-tasks': return withAttention(t, 'No tasks found in the plan · run it as one task, or ask for changes');
     case 'parked': return t.reason || 'Stopped · needs you';
     case 'running':
+      // Its runner is gone, but its agent may still be writing in the copy: nothing else runs there until it ends.
+      if (t.agentLeft) return `Podium's runner for ${named(t.agent)} stopped, and ${named(t.agent)} may still be working in this ticket's copy · nothing else runs there until it finishes`;
       if (isPlanning(t.phase)) return `${named(t.agent)} is ${t.phase === 'revise' ? 'changing' : 'writing'} the plan`;
       if (t.phase === 'check') return 'Running the full check before the PR';
+      if (t.phase === 'task-test') return `Task ${t.task} of ${t.of} · running the task test on this machine`;
+      if (t.phase === 'baseline') {
+        return t.baselineOf === 'check'
+          ? 'The full check failed; running it at the base to see if this ticket caused it'
+          : `Task ${t.task} of ${t.of} · the task test failed; running it at the base to see if this change caused it`;
+      }
       if (t.phase === 'check-fix') return `${named(t.agent)} is fixing what the full check found`;
       return `Task ${t.task} of ${t.of} · ${named(t.agent)} ${isReviewing(t.phase) ? 'reviewing' : t.phase === 'fix' ? 'fixing' : 'working'}`;
     case 'pending': return t.waitingOn?.length ? `Starts when ${andList(t.waitingOn)} ${t.waitingOn.length === 1 ? 'is' : 'are'} merged on GitHub`
       : t.slot === 'full' ? 'Waiting for a free slot' : t.slot === 'free' ? 'Starting' : 'Waiting to start';
     case 'waiting': return t.reason || 'Waiting';
-    case 'pr-open': return `PR #${t.pr?.number} open`;
+    case 'pr-open': return `PR #${t.pr?.number} open${ciWords(t)}`;
     case 'merged': return `PR #${t.pr?.number} merged`;
     case 'closed': return `PR #${t.pr?.number} closed without merging`;
     case 'stopped': return 'Stopped';
@@ -901,22 +956,32 @@ export function repoSummary(s, project) {
   const listed = s?.repoCommands?.[project];
   const commands = Array.isArray(listed) ? listed.filter((c) => typeof c === 'string') : [];
   const check = s?.repoCheck?.[project];
+  const taskTest = s?.repoTaskTest?.[project];
   const method = String(s?.repoMergeMethod?.[project] ?? '').toLowerCase();
+  const saved = s?.repoPlanDir?.[project];
+  const folder = typeof saved === 'string' ? saved.trim().replace(/\/+$/, '') : '';
   const parts = [
     commands.length ? commands.join(' ') : null,
     typeof check === 'string' && check.trim() ? 'full check set' : null,
+    typeof taskTest === 'string' && taskTest.trim() ? 'task test set' : null,
+    folder ? `plans in ${folder}` : null,
+    s?.repoKeepPlan?.[project] === true ? 'plans kept in PRs' : null,
     s?.repoSquash?.[project] === false ? 'commits kept' : null,
     MERGE_WORDS.includes(method) ? `${method} merges` : null,
   ].filter(Boolean);
   return parts.length ? parts.join(' · ') : 'nothing set';
 }
 
-// A draft's proposed commands and check (saved for the repo at Start): the board's This repo fold heading, short.
+// A draft's proposed commands, check, plans folder and whether PRs keep the plan (saved for the repo at Start): the
+// board's This repo fold heading, short.
 export function proposedSummary(p) {
   const commands = Array.isArray(p?.commands) ? p.commands : null;
   const parts = [
     commands ? (commands.length ? commands.join(' ') : 'no commands') : null,
     typeof p?.check === 'string' ? (p.check ? 'full check' : 'no full check') : null,
+    typeof p?.taskTest === 'string' ? (p.taskTest ? 'task test' : 'no task test') : null,
+    typeof p?.planDir === 'string' ? (p.planDir ? 'plans folder' : 'default plans folder') : null,
+    typeof p?.keepPlan === 'boolean' ? (p.keepPlan ? 'plans in PRs' : 'plans left out of PRs') : null,
   ].filter(Boolean);
   return parts.join(' · ');
 }
@@ -926,6 +991,9 @@ export function repoValuesText(v) {
   const parts = [
     Array.isArray(v?.commands) ? `commands ${v.commands.join(', ') || 'none'}` : null,
     typeof v?.check === 'string' ? (v.check ? `full check "${v.check}"` : 'no full check') : null,
+    typeof v?.taskTest === 'string' ? (v.taskTest ? `task test "${v.taskTest}"` : 'no task test') : null,
+    typeof v?.planDir === 'string' ? (v.planDir ? `plans folder "${v.planDir}"` : 'default plans folder') : null,
+    typeof v?.keepPlan === 'boolean' ? (v.keepPlan ? 'plans kept in PRs' : 'plans left out of PRs') : null,
   ].filter(Boolean);
   return parts.join('; ');
 }
@@ -935,6 +1003,49 @@ export const startedNotice = (applied) => {
   const text = repoValuesText(applied);
   return text ? `Started. Saved for this repo: ${text}.` : 'Started.';
 };
+
+// Uncommitted changes Podium saved aside before cleaning a copy, and where to find them.
+const savedLine = (saved) => (saved ? ` Changes left uncommitted in its copy were saved as a git stash ("${saved}"): git stash list shows it.` : '');
+// After Sync with base: how much of the base came in (the tool's reply and the pane's notice).
+export const syncedText = (key, base, commits, saved = null) => `${key} took ${commits} new commit${commits === 1 ? '' : 's'} from ${base || 'its base'}.${savedLine(saved)}`;
+// After Keep or Drop on commits Podium didn't make. Dropped ones are named, so they can be found again in git's reflog.
+export const commitsAnswerText = (key, keep, dropped = [], saved = null) => `${keep
+  ? `${key} keeps the commits and carries on from them.`
+  : `${key}'s copy is back where Podium left it.${dropped.length ? ` Dropped (git's reflog keeps them for a while): ${dropped.join('; ')}.` : ''}`}${savedLine(saved)}`;
+// Under a ticket stopped on its task's tests: where they ran, and the ways on.
+export const testsParkHint = (t) => (t.testsWhere === 'host'
+  ? 'Podium ran these on this machine. Retry gives the writer the log; if the result is fine, accept it and the task goes to its review.'
+  : `These ran in ${named(t.agent)}'s sandbox, not on this machine. If the result is fine, accept it and the task goes to its review; or set a task test (Settings → This repo) so Podium runs the tests here.`);
+// The Accept and continue form's line: who reviews the task next (the stuck task's reviewer, when the pane has it), and what
+// they are told.
+export const acceptLine = (reviewer) => `${reviewer ? named(reviewer) : 'Its reviewer'} reviews it next, told what you said and not to fail it for these results.`;
+
+// The Review again with evidence form's line: who reviews the task again, and what they do with it.
+export const evidenceLine = (reviewer) => `${reviewer ? named(reviewer) : 'Its reviewer'} reviews it again, weighing this before failing it for tests it couldn't run.`;
+
+// A parked ticket's Retry button: once the person has released the locked file, Retry tries the interrupted
+// operation again. Anything else, including older tickets without the field, reads ordinary.
+export const ticketRetryLabel = (t) => t.state === 'parked' && t.checkpointLock
+  ? "I've released it — Retry"
+  : 'Retry';
+
+// A ticket parked because a file was locked while Podium saved its changes: what to release and how to
+// retry. Null for anything else, including older tickets without the field and tickets that have moved on
+// (Retry clears the field; even a stale one reads ordinary once the ticket is not parked). Podium never
+// releases the file itself; the person does, then retries.
+export function checkpointLockHint(t) {
+  const lock = t?.state === 'parked' ? t?.checkpointLock : null;
+  if (!lock) return null;
+  const file = typeof lock.file === 'string' && lock.file ? lock.file : 'an unidentified file';
+  const dotnet = lock.hint === 'dotnet' ? " For a .NET compiler server, run dotnet build-server shutdown in this ticket's copy first." : '';
+  return `${file} is still open in a program. Close the program holding the file, then press ${ticketRetryLabel(t)}. The ticket's copy and any stash Git made have been kept.${dotnet}`;
+}
+
+// Who reads a note on a ticket (the pane's note form, and the reply once it is saved). A step already running doesn't.
+export const noteReaders = (key, running = false) => (running
+  ? `The step running now won't see it; every later step of ${key} will.`
+  : `Every later planner, writer and reviewer of ${key} reads it.`);
+export const notedText = (key, running = false) => `Noted on ${key}. ${noteReaders(key, running)}`;
 
 // The board's warning while the sprint's repo has no full check.
 export const NO_CHECK_LINE = 'No full check for this repo: PRs open without one';

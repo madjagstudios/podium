@@ -7,8 +7,9 @@ import { PERMISSIONS, DEFAULT_PERMISSION } from './adapters/builtin.js';
 import { permissionText, unattendedWarning } from './adapters/build.js';
 import { detectAgent } from './discover.js';
 import { loadSettings } from './settings.js';
-import { projectKey, ticketKey } from './paths.js';
+import { projectKey, projectHere, ticketKey, worktreeDir } from './paths.js';
 import { createJob, updateJob, readJob, findJobDir, listJobDirs } from './store.js';
+import { agentLingers } from './status.js';
 import { ghJson } from './gh.js';
 import { reviewPrompt } from './pr.js';
 import { threadSteps, contextBrief } from './thread.js';
@@ -17,6 +18,7 @@ import { assertArg, spawnDetachedNode } from './launch.js';
 import { PodiumError, sprintJobError } from './errors.js';
 import { readOutput } from './retention.js';
 import { standingText, withInstructions } from './instructions.js';
+import { pointerOnly } from './sprint-text.js';
 
 const RUN_JOB = fileURLToPath(new URL('./run-job.js', import.meta.url));
 
@@ -72,7 +74,11 @@ export async function preflight(root, { agent, permission, model, cwd }) {
 }
 
 export async function dispatch(root, opts) {
-  let { agent, permission, model = null, ticket = null, cwd, prompt, includeUncommitted = false, base = null, from = null, session = null, followUp = null, review = null, branch = null, meta = null, env = process.env } = opts;
+  let { agent, permission, model = null, ticket = null, cwd, prompt, includeUncommitted = false, base = null, from = null, session = null, followUp = null, review = null, branch = null, meta = null, env = process.env, inCopy = null, project = null } = opts;
+  // project: a sprint's steps are filed under the sprint's project (the key it was made with).
+  // inCopy ({ worktree, repoRoot }): a sprint's reviewer works in its ticket's own copy, never one of its own.
+  if (inCopy && (!meta?.sprint || followUp || review || base)) throw new PodiumError('bad-copy', "Only a sprint's own review step can work in a ticket's copy.");
+  if (review && followUp) throw new PodiumError('review-follow-up', "A PR review starts its own copy of the PR, so it can't continue other work. Dispatch again with pr only.");
   let info = null;
   if (review) {
     // A review of PR #n: read-only, in its own copy of the PR's head.
@@ -83,12 +89,16 @@ export async function dispatch(root, opts) {
   let prev = null;
   if (followUp) {
     prev = readJob(findJobDir(root, followUp));
+    if (prev.kind === 'review') throw new PodiumError('review-not-continuable', `Job ${followUp} is a PR review, and a review can't be continued. To review the PR again, dispatch with pr and say what to look at.`);
     // A sprint's work is continued only by the sprint (it passes its own meta).
     if (prev.sprint && !meta?.sprint) throw sprintJobError();
     const steps = threadSteps(root, prev);
+    if (!steps.length) throw new PodiumError('not-continuable', `Job ${followUp} can't be continued.`);
     const latest = steps[steps.length - 1];
     if (latest.id !== prev.id) throw new PodiumError('not-latest', `Job ${followUp} is not the latest step of its thread; continue from ${latest.id}.`);
     if (['queued', 'running'].includes(prev.status)) throw new PodiumError('thread-busy', 'A step of this work is still running. Wait for it or cancel it first.');
+    // Its runner is gone, but its agent may still be writing in the copy the next step would work in.
+    if (agentLingers(prev)) throw new PodiumError('agent-still-running', `Job ${followUp} stopped unexpectedly, but its agent (process ${prev.agentPid}) is still running in its copy. Wait for it to finish, or end that process, then continue.`);
     if (['kept', 'discarded', 'merged', 'closed'].includes(prev.status)) throw new PodiumError('thread-closed', 'That work has left the thread; start a new job (it starts from your checkout).');
     if (permission && permission !== prev.permission) throw new PodiumError('permission-locked', `This work runs with "${prev.permission}". To change it, start a new job.`);
     permission = prev.permission;
@@ -98,6 +108,13 @@ export async function dispatch(root, opts) {
   if (!prompt || !prompt.trim()) throw new PodiumError('empty-prompt', 'The task description is empty.');
   const check = await preflight(root, { agent, permission, model, cwd });
   if (!check.ok) throw new PodiumError('preflight-failed', check.problems.map((p) => p.message).join(' '), { problems: check.problems });
+  // A plain job's whole task is a key or a link: the agent may not be able to open the tracker it points at.
+  const warnings = [
+    ...check.warnings,
+    ...(!review && !followUp && !meta?.sprint && pointerOnly(prompt)
+      ? [{ code: 'ticket-pointer-only', message: "The task is only a ticket key or link. Most agents can't open a tracker, so paste the ticket's text into the task." }]
+      : []),
+  ];
 
   let top = null;
   let start = null;
@@ -114,7 +131,8 @@ export async function dispatch(root, opts) {
 
   const settings = loadSettings(root);
   const { job, dir } = createJob(root, {
-    project: projectKey(cwd), ticket: ticketKey(ticket), agent, model, permission: check.permission, cwd: path.resolve(cwd), prompt,
+    // A follow-up stays in its thread's project, which may be an older key for the same folder.
+    project: prev?.project ?? project ?? projectKey(cwd), ticket: ticketKey(ticket), agent, model, permission: check.permission, cwd: path.resolve(cwd), prompt,
   });
   updateJob(root, dir, { origin: session ? { session } : null });
   // Sprint steps carry their place in the sprint, set before the runner starts.
@@ -144,16 +162,24 @@ export async function dispatch(root, opts) {
   }
   if (review) {
     const top = await repoRoot(cwd);
-    const worktree = path.join(root, 'worktrees', job.id);
+    const worktree = path.join(worktreeDir(root, settings), job.id);
     const baseCommit = await createReviewCopy(top, worktree, info.number);
     await gitIn(top, ['fetch', '-q', 'origin', info.baseRefName]).catch(() => {});
-    const host = listJobDirs(root, { project: job.project }).map(readJob).find((j) => j.pr?.number === info.number && j.kind !== 'review');
+    const host = listJobDirs(root, { project: projectHere(cwd) }).map(readJob).find((j) => j.pr?.number === info.number && j.kind !== 'review');
     updateJob(root, dir, {
       kind: 'review', reviewOf: { number: info.number, url: info.url }, step: null,
       repoRoot: top, worktree, branch: null, baseCommit, threadId: host ? (host.threadId ?? host.id) : job.id,
     }, 'worktree');
     spawnDetachedNode(RUN_JOB, [root, dir]);
-    return { job: readJob(dir), dir, warnings: check.warnings, permissionText: check.permissionText };
+    return { job: readJob(dir), dir, warnings, permissionText: check.permissionText };
+  }
+  if (inCopy) {
+    // It gets a temp folder of its own (scratchTmp, runner.js), outside the repo; the sprint puts the copy
+    // back to this commit once the review has been read.
+    const baseCommit = await gitIn(inCopy.worktree, ['rev-parse', 'HEAD']);
+    updateJob(root, dir, { repoRoot: inCopy.repoRoot, worktree: inCopy.worktree, branch: null, baseCommit, scratchTmp: true }, 'worktree');
+    spawnDetachedNode(RUN_JOB, [root, dir]);
+    return { job: readJob(dir), dir, warnings, permissionText: check.permissionText };
   }
   const reuse = prev && prev.worktree && fs.existsSync(prev.worktree);
   if (reuse) {
@@ -168,7 +194,7 @@ export async function dispatch(root, opts) {
     }
     if ((check.permission === 'edit-worktree' && settings.worktreeForEdits) || base || fromCommitted) {
       top ??= await repoRoot(cwd);
-      const worktree = path.join(root, 'worktrees', job.id);
+      const worktree = path.join(worktreeDir(root, settings), job.id);
       const name = branch ?? `podium/${job.id}`;
       let baseCommit = await createWorktree(top, worktree, name, start);
       let includedUncommitted = false;
@@ -181,5 +207,5 @@ export async function dispatch(root, opts) {
   }
   if (prev) updateJob(root, findJobDir(root, prev.id), { status: 'continued', endStatus: prev.status, continuedBy: job.id }, 'continued');
   spawnDetachedNode(RUN_JOB, [root, dir]);
-  return { job: readJob(dir), dir, warnings: check.warnings, permissionText: check.permissionText };
+  return { job: readJob(dir), dir, warnings, permissionText: check.permissionText };
 }

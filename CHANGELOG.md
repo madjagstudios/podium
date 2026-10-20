@@ -2,6 +2,26 @@
 
 Each section is what Podium shows under "What's new" after an update.
 
+## 0.5.0
+
+- Writers and reviewers see the ticket's own text, not just its key, so agents that can't open your tracker still know what to build. A draft warns when a ticket only points at the tracker.
+- A writer step that changes nothing isn't counted as done: the ticket stops, unless the writer says why no change was needed.
+- A per-repo task test runs on your machine after each writer step, outside the agent's sandbox, and its result decides whether the task goes to review.
+- A test or full check that fails runs again on the ticket's starting code. Failures that were already there go to review marked as such, and you can accept a task's test results with your reason.
+- Reviewers work in the ticket's own copy with a writable temp folder, so they can run the tests, and you can hand them evidence such as a CI run that passed.
+- Sync with base brings a fix that landed after a ticket started into its copy. Podium never drops commits it didn't make; it asks whether to keep them.
+- Notes for a ticket: your decisions and instructions reach every later planner, writer and reviewer on it.
+- Plans go in the folder you choose for each repo, and a plan saved elsewhere is picked up instead of stopping the ticket.
+- A sprint's plan stays in Podium's record but out of the PR, unless the repo keeps plans.
+- PR descriptions and commit messages are written from the plan's summary, never pasted from the ticket. In a public repo, lines naming another project's ticket, an agent or a term you've marked private are left out, and Podium tells you what it removed.
+- A plan can leave checks to the PR's CI. Podium follows that CI, tells you once whether it passed, and auto-merge waits for it.
+- A plan that would deploy, publish or delete names those commands, and runs only after you agree to them.
+- A file held open by a program no longer dead-ends a ticket: it stops with its work kept and says how to release the file. .NET builds no longer leave compiler servers running.
+- Notices: old ones no longer flood a chat that didn't ask for them, several arriving together are each marked delivered, and chats in a worktree see their repo's jobs.
+- A stop that the system refuses no longer leaves test or check processes running.
+- A draft warns when the repo's CI runs checks its full check doesn't.
+- Podium's copies live in a folder without spaces, so tests that build file paths from their own location keep working.
+
 ## 0.4.0
 
 - A new sprint opens as a draft on a board in the pane. There you can change who writes and reviews each task, the order of the tickets, Merge when green and how many tickets run at once, and then press Start or ask Claude to start it.

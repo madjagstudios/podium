@@ -3,7 +3,7 @@
 // on the pure helper; the kit tests cover the fallback into the visible message.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { handOver, sprintNewsPass, keepFresh } from '../mod/delivery.js';
+import { handOver, sprintNewsPass, keepFresh, arrivals } from '../mod/delivery.js';
 
 // A hand-over world: what the hidden row and the visible message received.
 function world({ appendFails = false, appendAnswer, submitFails = false } = {}) {
@@ -58,6 +58,64 @@ test('a prompt a hook dropped on purpose still counts as handled', async () => {
   assert.equal(await handOver(w.deps), true);
 });
 
+// The host can start one turn holding several prompts that waited behind a busy one, and then settle only the last
+// prompt's submit; the others never settle. A started turn holding the headline is the proof the message went in.
+const tick = () => new Promise((r) => setImmediate(r));
+const never = () => new Promise(() => {});
+
+test('a hand-over whose submit never settles counts as in once a turn starts holding its headline, and not before', { timeout: 2000 }, async () => {
+  const w = world();
+  const seen = arrivals();
+  w.deps.submit = (text) => { w.submitted.push(text); return never(); };
+  let settled = null;
+  const going = handOver({ ...w.deps, arrived: (text) => seen.expect(text) }).then((v) => { settled = v; });
+  await tick();
+  assert.deepEqual(w.submitted, [w.deps.headline]);
+  seen.turnStarted('Podium: Codex finished: "Something else"');
+  await tick();
+  assert.equal(settled, null, 'a turn without its headline proves nothing');
+  seen.turnStarted(`The podium plugin sent a message:\nPodium: Codex finished: "Other"\n${w.deps.headline}`);
+  await going;
+  assert.equal(settled, true);
+});
+
+test('with no hidden row, the headline still opens the message, and a turn holding it counts', { timeout: 2000 }, async () => {
+  const w = world({ appendFails: true });
+  const seen = arrivals();
+  w.deps.submit = (text) => { w.submitted.push(text); return never(); };
+  const going = handOver({ ...w.deps, arrived: (text) => seen.expect(text) });
+  await tick();
+  seen.turnStarted(`The podium plugin sent a message:\n${w.submitted[0]}`);
+  assert.equal(await going, true);
+});
+
+test('identical headlines are counted: a turn holding one confirms only the oldest, a turn holding two confirms two', async () => {
+  const seen = arrivals();
+  const headline = 'Podium: Codex finished "Review PR #40".';
+  const order = [];
+  for (const name of ['a', 'b']) seen.expect(headline).seen.then(() => order.push(name));
+  seen.turnStarted(`The podium plugin sent a message:\n${headline}`);
+  await tick();
+  assert.deepEqual(order, ['a']);
+  seen.expect(headline).seen.then(() => order.push('c'));
+  seen.turnStarted(`${headline}\n${headline}`);
+  await tick();
+  assert.deepEqual(order, ['a', 'b', 'c']);
+});
+
+test('a hand-over that settled or failed stops waiting, so a later turn confirms the next one with that headline', { timeout: 2000 }, async () => {
+  const seen = arrivals();
+  const arrived = (text) => seen.expect(text);
+  assert.equal(await handOver({ ...world().deps, arrived }), true);
+  assert.equal(await handOver({ ...world({ submitFails: true }).deps, arrived }), false);
+  const w = world();
+  w.deps.submit = never;
+  const going = handOver({ ...w.deps, arrived });
+  await tick();
+  seen.turnStarted(w.deps.headline);
+  assert.equal(await going, true);
+});
+
 // A sprint news world: an inbox, a log of what went in, and a mark that fails `markFails` times.
 function newsWorld({ markFails = 0, sendOk = true } = {}) {
   const w = { announced: new Set(), inFlight: new Set(), inbox: [], sent: [], marks: [], markFails };
@@ -74,6 +132,24 @@ function newsWorld({ markFails = 0, sendOk = true } = {}) {
   return w;
 }
 const NEWS = { id: 's1:1', sprint: 'Oct week 2', text: 'ABC-12 (Payouts) needs you' };
+
+test('sprint news whose send never settles is marked once a turn starts holding it, and the next pass runs', { timeout: 2000 }, async () => {
+  const seen = arrivals();
+  const w = newsWorld();
+  const busy = { on: false };
+  w.deps.send = (list) => handOver({
+    append: async () => {}, details: 'details', headline: `Podium: ${list.map((m) => m.text).join(' · ')}`,
+    submit: (text) => { w.sent.push(text); return never(); }, arrived: (text) => seen.expect(text),
+  });
+  w.inbox = [NEWS];
+  const pass = sprintNewsPass({ busy, ...w.deps });
+  await tick();
+  assert.deepEqual(w.sent, ['Podium: ABC-12 (Payouts) needs you']);
+  seen.turnStarted(`The podium plugin sent a message:\n${w.sent[0]}`);
+  await pass;
+  assert.deepEqual(w.marks, [['s1:1']]);
+  assert.equal(busy.on, false);
+});
 
 test('sprint news goes in once and is marked delivered', async () => {
   const w = newsWorld();
@@ -165,6 +241,34 @@ test('a pass that throws lets go, so the next pass runs', async () => {
   w.deps.claim = async () => [NEWS];
   await sprintNewsPass({ ...w.deps, busy });
   assert.deepEqual(w.sent, [['s1:1']]);
+});
+
+test('sprint news renews its claim while its send waits behind a busy turn, and stops once the send settles', { timeout: 2000 }, async () => {
+  const w = newsWorld();
+  let release;
+  const renewed = [];
+  const beats = [];
+  w.deps.sleep = () => new Promise((r) => beats.push(r));
+  w.deps.refresh = async (ids) => { renewed.push(ids); };
+  w.deps.send = (list) => new Promise((resolve) => { release = () => { w.sent.push(list.map((m) => m.id)); resolve(true); }; });
+  w.inbox = [NEWS];
+  const pass = sprintNewsPass(w.deps);
+  const beat = async () => {
+    for (let i = 0; !beats.length && i < 200; i++) await new Promise((r) => setImmediate(r));
+    assert.ok(beats.length, 'the send is waited on with a heartbeat');
+    beats.shift()();
+    await new Promise((r) => setImmediate(r));
+  };
+  await beat();
+  await beat();
+  assert.deepEqual(renewed, [['s1:1'], ['s1:1']], 'renewed on each beat while the send waits');
+  release();
+  await pass;
+  const after = renewed.length;
+  for (const r of beats.splice(0)) r();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(renewed.length, after, 'no renewal once the send has settled');
+  assert.deepEqual(w.marks, [['s1:1']]);
 });
 
 test('a send that fails clears the in-flight mark, so the notice is tried again', async () => {

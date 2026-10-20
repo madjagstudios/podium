@@ -5,7 +5,7 @@ import path from 'node:path';
 import { saveAdapter } from '../engine/adapters/registry.js';
 import { dispatch } from '../engine/dispatch.js';
 import { readJob, updateJob, findJobDir, createJob } from '../engine/store.js';
-import { slugOf, branchName, prBody, openPr, pushPr, checksOf, attentionOf, mergeDecision, refreshPr, mergePr, setAutoMerge, fixPrompt, updateThread, browsePr, finishLocked, FINISH_LOCK, watchAgain } from '../engine/pr.js';
+import { slugOf, branchName, prBody, openPr, pushPr, checksOf, attentionOf, mergeDecision, refreshPr, mergePr, setAutoMerge, fixPrompt, updateThread, browsePr, finishLocked, FINISH_LOCK, watchAgain, ciVerdict, ciNews, CI_NONE_MS } from '../engine/pr.js';
 import { keep } from '../engine/review.js';
 import { tempRoot, fakeAdapter, waitFor, ghWorld } from './helpers.js';
 import { setSetting } from '../engine/settings.js';
@@ -85,7 +85,7 @@ const ROLLUP = [
 
 test('checks, attention and the merge decision', () => {
   const c = checksOf(ROLLUP);
-  assert.deepEqual(c, { total: 4, passed: 2, failed: 1, running: 1, failing: ['test (windows)'], failedRunId: '102' });
+  assert.deepEqual(c, { total: 4, passed: 2, failed: 1, running: 1, failing: ['test (windows)'], failedRunId: '102', skipped: 0, cancelled: 0 });
   const green = { state: 'OPEN', checks: checksOf([ROLLUP[0], ROLLUP[3]]), mergeable: 'MERGEABLE', review: null, blocked: null };
   assert.equal(mergeDecision(green), true);
   assert.equal(mergeDecision({ ...green, checks: c }), false);
@@ -445,4 +445,106 @@ test('a PR-end lock whose stat keeps failing with EPERM is waited for, and refus
   assert.ok(took >= 400 && took < 3000, `gave up at about the deadline (${took} ms)`);
   assert.ok(stats >= 2 && stats <= 20, `a bounded number of tries (${stats})`);
   assert.equal(fs.existsSync(lock), true, 'a lock of unknown age is never taken for stale');
+});
+
+const CI_CHECKS = ['CI is green on all three OSes', 'No Node 20 deprecation annotations'];
+const ciRun = (name, status, conclusion = null) => ({ __typename: 'CheckRun', name, status, conclusion, detailsUrl: 'https://github.com/o/r/actions/runs/7/job/1' });
+
+test('a PR whose plan left checks to its CI follows that CI', () => {
+  const opened = new Date(Date.now() - 60_000).toISOString();
+  const pr = (rollup, over = {}) => ({ state: 'OPEN', ciChecks: CI_CHECKS, checks: checksOf(rollup), openedAt: opened, ...over });
+  assert.equal(ciVerdict({ ...pr([]), ciChecks: undefined }), null);
+  assert.equal(ciVerdict(pr([])), 'waiting', 'nothing reported yet, just after opening');
+  assert.equal(ciVerdict(pr([]), Date.parse(opened) + CI_NONE_MS + 1), 'none');
+  assert.equal(ciVerdict(pr([ciRun('test', 'IN_PROGRESS')])), 'waiting');
+  assert.equal(ciVerdict(pr([ciRun('test', 'COMPLETED', 'SUCCESS'), ciRun('lint', 'IN_PROGRESS')])), 'waiting');
+  assert.equal(ciVerdict(pr([ciRun('test', 'COMPLETED', 'FAILURE'), ciRun('lint', 'IN_PROGRESS')])), 'failed', 'a failure is final for this run');
+  assert.equal(ciVerdict(pr([ciRun('test', 'COMPLETED', 'SUCCESS'), ciRun('lint', 'COMPLETED', 'SKIPPED')])), 'passed');
+  // A run a newer push replaced is cancelled, not failed: the next run decides.
+  assert.equal(ciVerdict(pr([ciRun('test', 'COMPLETED', 'CANCELLED')])), 'waiting');
+  assert.equal(ciVerdict(pr([ciRun('test', 'COMPLETED', 'CANCELLED'), ciRun('lint', 'COMPLETED', 'FAILURE')])), 'failed');
+  // Every check skipped: nothing ran, so nothing checked what the plan left to CI.
+  const skipped = pr([ciRun('test', 'COMPLETED', 'SKIPPED'), ciRun('lint', 'COMPLETED', 'NEUTRAL')]);
+  assert.equal(ciVerdict(skipped), 'none');
+  assert.equal(mergeDecision({ ...skipped, mergeable: 'MERGEABLE', review: null, blocked: null }), false, 'never auto-merged');
+  assert.match(ciNews({ ...skipped, number: 12, title: 'ABC-11: Login form' }, 'none'), /: every CI check was skipped, so nothing checked/);
+});
+
+test('auto-merge waits for a passing CI on a PR whose plan left checks to it', () => {
+  const green = { state: 'OPEN', checks: checksOf([]), mergeable: 'MERGEABLE', review: null, blocked: null, openedAt: new Date().toISOString() };
+  assert.equal(mergeDecision(green), true, 'unchanged without CI checks');
+  assert.equal(mergeDecision({ ...green, ciChecks: CI_CHECKS }), false, 'no check reported yet');
+  assert.equal(mergeDecision({ ...green, ciChecks: CI_CHECKS, checks: checksOf([ciRun('test', 'COMPLETED', 'SUCCESS')]) }), true);
+});
+
+test('the CI news says what the plan left to CI and how it went', () => {
+  const pr = { number: 12, title: 'ABC-11: Login form', ciChecks: CI_CHECKS, checks: { failing: ['test (windows)'] } };
+  assert.equal(ciNews(pr, 'passed'), "ABC-11: Login form (PR #12): CI passed, so the checks the plan left to it passed: CI is green on all three OSes; No Node 20 deprecation annotations.");
+  assert.equal(ciNews(pr, 'failed'), "ABC-11: Login form (PR #12): CI failed (test (windows)), so the checks the plan left to it did not pass: CI is green on all three OSes; No Node 20 deprecation annotations. Fix it on the PR's branch before it merges.");
+  assert.match(ciNews(pr, 'none'), /^ABC-11: Login form \(PR #12\): no CI check reported in 30 minutes, so nothing checked what the plan left to CI: .*\. Check these by hand before it merges\.$/);
+});
+
+const ciView = (rollup) => ({ match: ['pr', 'view'], stdout: { state: 'OPEN', mergeable: 'MERGEABLE', reviewDecision: '', statusCheckRollup: rollup, comments: [], reviews: [], mergeCommit: null } });
+const answerView = (w, rollup) => {
+  const spec = JSON.parse(fs.readFileSync(w.env.PODIUM_FAKE_GH, 'utf8'));
+  spec.responses = [...spec.responses.filter((r) => !(r.match[0] === 'pr' && r.match[1] === 'view')), ciView(rollup)];
+  fs.writeFileSync(w.env.PODIUM_FAKE_GH, JSON.stringify(spec));
+};
+
+test('a PR opened with CI checks keeps them, and each settled CI result is recorded once', async () => {
+  const root = tempRoot();
+  saveAdapter(root, fakeAdapter('edit'));
+  const w = ghWorld([CREATED, ciView([ciRun('test', 'IN_PROGRESS')])]);
+  const job = await openPr(root, (await editJob(root, w.repo)).id, { env: w.env, ciChecks: CI_CHECKS });
+  assert.deepEqual(job.pr.ciChecks, CI_CHECKS);
+  const plain = await openPr(root, (await editJob(root, w.repo)).id, { env: w.env });
+  assert.equal('ciChecks' in plain.pr, false, 'no field without CI checks');
+  let fresh = await refreshPr(root, job.id, { env: w.env });
+  assert.equal(fresh.pr.ciSaid ?? null, null);
+  answerView(w, [ciRun('test', 'COMPLETED', 'SUCCESS')]);
+  fresh = await refreshPr(root, job.id, { env: w.env });
+  assert.equal(fresh.pr.ciSaid, 'passed');
+  assert.equal(fresh.pr.ciRound, 1);
+  fresh = await refreshPr(root, job.id, { env: w.env });
+  assert.equal(fresh.pr.ciRound, 1, 'the same result is not counted twice');
+  answerView(w, [ciRun('test', 'IN_PROGRESS')]);
+  fresh = await refreshPr(root, job.id, { env: w.env });
+  assert.equal(fresh.pr.ciSaid, null, 'running again after a push');
+  answerView(w, [ciRun('test', 'COMPLETED', 'FAILURE')]);
+  fresh = await refreshPr(root, job.id, { env: w.env });
+  assert.equal(fresh.pr.ciSaid, 'failed');
+  assert.equal(fresh.pr.ciRound, 2);
+});
+
+test('a CI result counted but never told (cut short by a crash) is told on the next refresh, once', async () => {
+  const root = tempRoot();
+  saveAdapter(root, fakeAdapter('edit'));
+  const w = ghWorld([CREATED, ciView([ciRun('test', 'COMPLETED', 'SUCCESS')])]);
+  const job = await openPr(root, (await editJob(root, w.repo)).id, { env: w.env, ciChecks: CI_CHECKS });
+  const sid = 'sprint-ci-untold';
+  fs.mkdirSync(path.join(root, 'sprints', sid), { recursive: true });
+  const dir = findJobDir(root, job.id);
+  // What a refresh that stopped right after counting the round leaves: counted, said, never told.
+  updateJob(root, dir, { sprint: { id: sid, ticket: 'ABC-12', task: 1, role: 'author' }, pr: { ...readJob(dir).pr, checks: checksOf([ciRun('test', 'COMPLETED', 'SUCCESS')]), ciSaid: 'passed', ciRound: 1 } }, 'test');
+  let fresh = await refreshPr(root, job.id, { env: w.env });
+  assert.equal(fresh.pr.ciTold, 1);
+  assert.deepEqual(readJob(dir).sprintNews.map((n) => n.key), ['pr:12:ci:1']);
+  fresh = await refreshPr(root, job.id, { env: w.env });
+  assert.equal(fresh.pr.ciRound, 1);
+  assert.deepEqual(readJob(dir).sprintNews.map((n) => n.key), ['pr:12:ci:1'], 'told once');
+});
+
+test('a sprint step\'s CI news its sprint can\'t take yet waits in the step\'s outbox', async () => {
+  const root = tempRoot();
+  saveAdapter(root, fakeAdapter('edit'));
+  const w = ghWorld([CREATED, ciView([ciRun('test', 'COMPLETED', 'SUCCESS')])]);
+  const job = await openPr(root, (await editJob(root, w.repo)).id, { env: w.env, ciChecks: CI_CHECKS });
+  // A sprint whose folder is there but whose state can't be read yet: its news is kept for later, never dropped.
+  const sid = 'sprint-ci-outbox';
+  fs.mkdirSync(path.join(root, 'sprints', sid), { recursive: true });
+  updateJob(root, findJobDir(root, job.id), { sprint: { id: sid, ticket: 'ABC-12', task: 1, role: 'author' } }, 'test');
+  const fresh = await refreshPr(root, job.id, { env: w.env });
+  assert.equal(fresh.pr.ciSaid, 'passed');
+  const kept = readJob(findJobDir(root, job.id)).sprintNews;
+  assert.deepEqual(kept, [{ key: 'pr:12:ci:1', text: ciNews(fresh.pr, 'passed') }]);
 });

@@ -68,6 +68,21 @@ test('dispatch runs a job in the background to completion', async () => {
   assert.ok(fs.existsSync(path.join(res.dir, 'summary.md')));
 });
 
+test('dispatch warns when the task is only a ticket key or link, and starts the job anyway', async () => {
+  const root = tempRoot();
+  saveAdapter(root, fakeAdapter('summary'));
+  const cwd = tempRepo();
+  const warning = { code: 'ticket-pointer-only', message: "The task is only a ticket key or link. Most agents can't open a tracker, so paste the ticket's text into the task." };
+  for (const [prompt, warns] of [['XYZ-60', true], ['https://example.atlassian.net/browse/XYZ-60', true], ['Fix the login form: XYZ-60 says a wrong password must say so.', false]]) {
+    const res = await dispatch(root, { agent: 'fake', permission: 'read-only', cwd, prompt });
+    assert.equal(res.job.status, 'queued', prompt);
+    assert.equal(fs.readFileSync(path.join(res.dir, 'prompt.md'), 'utf8'), prompt, 'the job was created with that task');
+    const found = res.warnings.filter((w) => w.code === 'ticket-pointer-only');
+    assert.deepEqual(found, warns ? [warning] : [], prompt);
+    await waitFor(() => readJob(res.dir).status === 'done');
+  }
+});
+
 test('dispatch of an edit job creates a worktree and waits for review', async () => {
   const root = tempRoot();
   saveAdapter(root, fakeAdapter('edit'));
@@ -78,6 +93,21 @@ test('dispatch of an edit job creates a worktree and waits for review', async ()
   const job = await waitFor(() => { const j = readJob(res.dir); return j.status === 'needs-review' && j; });
   assert.equal(job.hasChanges, true);
   assert.equal(fs.existsSync(path.join(repo, 'fake-edit.txt')), false);
+});
+
+test('dispatch puts an edit job copy in the chosen copies folder', async () => {
+  const root = tempRoot();
+  const copies = tempRoot();
+  saveAdapter(root, fakeAdapter('edit'));
+  setSetting(root, 'worktreeRoot', copies);
+  const repo = tempRepo();
+  const res = await dispatch(root, { agent: 'fake', permission: 'edit-worktree', cwd: repo, prompt: 'Edit' });
+  const got = fs.realpathSync.native(res.job.worktree);
+  const want = fs.realpathSync.native(copies);
+  assert.ok(got.startsWith(want + path.sep), `${got} is under ${want}`);
+  assert.equal(fs.existsSync(res.job.worktree), true);
+  const job = await waitFor(() => { const j = readJob(res.dir); return j.status === 'needs-review' && j; });
+  assert.equal(job.hasChanges, true);
 });
 
 test('dispatch refuses empty prompts and failed preflight', async () => {

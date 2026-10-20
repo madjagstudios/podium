@@ -1,19 +1,23 @@
-// Kit tests for the mod (`claude plugin test .`). How the kit behaves (Claude Code 2.1.28x):
+// Kit tests for the mod (`claude plugin test .`). How the kit behaves (Claude Code 2.1.302):
 // - session.start runs before each test body, so /podium and the mcp__podium__* tools are ready.
 // - Test hooks stand for the engine beneath the plugin. One standing in for a `$` call
-//   (process.run, ui.open, model.complete, fs.read, prompt.fill) answers { value: <result> }; one
-//   answering an event (turn.complete, prompt.submit) returns the result itself ({ text } or { drop }).
+//   (process.run, ui.open, model.complete, fs.read) answers { value: <result> }; one answering an event
+//   (turn.complete, prompt.submit, prompt.fill) returns the result itself ({ text } or { drop }; { isFilled }).
 //   A prompt.submit hook answering { value } makes the submit fail, which the mod now notices.
 // - The kit has no ui.open (stub it), ui.status or ui.toast (dropped with a note, harmless).
-// - The kit has no session.append, and a test hook cannot answer it: on('session.append', ...) is never called, though the kit's own
-//   error suggests it. So in the kit the hidden row always fails and delivery takes the fallback: one submit, headline first
-//   with the details after it, then marked. The row-succeeds path (headline only) is tested on mod/delivery.js
-//   (tests/mod-delivery.test.js), and the row itself in the app.
+// - The kit keeps session.append's row, so delivery takes the hidden-row path: the details as a row, then the headline
+//   alone (rowsOf sees each row). A hook that throws is skipped (the row is still kept) and one answering { deny } is a
+//   refusal the mod respects, so the paths where the row can't be added are tested on mod/delivery.js
+//   (tests/mod-delivery.test.js), and the texts each caller hands over on jobHandOver and newsHandOver
+//   (tests/mod-view.test.js). Before 2.1.30x the kit had no session.append and every delivery took that fallback.
 // - $.command.run needs args ('' for none); $.tool.call takes the tool's arguments at the top level.
 // - $.ui.mount({ plugin, surface, component, props, requestId }); find({ type, text: /re/ }), press({ key }),
 //   input({ key, text }) resolve after the handler's unawaited work settles.
 // - A timer set in session.start is not driven by a mock.clock made in the test body: drive
 //   delivery with $.turn.complete instead.
+// - $.turn.start({ text, turnId }) runs the mod's turn.start hook (a test hook answers { turnId } beneath it). A
+//   prompt.submit hook may answer with a promise it holds, standing in for a submit the host never settles; then
+//   don't await the turn.complete that delivers, poll (until) instead.
 // - $.fs.read sees Windows paths (backslashes) even when given forward slashes: normalise before matching.
 // - mounted.drawn() returns the whole drawn tree, props included; find() without a type matches Button labels too.
 // - PODIUM_JOB_ID cannot be set before session.start in the kit, so the inert path is checked with a real Claude job.
@@ -101,6 +105,11 @@ async function drawnText(pane: any) { return JSON.stringify(await drawnAll(pane)
 async function endTurn($: any) {
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
 }
+// Waits up to a second for `ok`: for a delivery left waiting on a submit the test holds.
+async function until(ok: () => boolean) {
+  for (let i = 0; i < 200 && !ok(); i++) await new Promise((r) => setTimeout(r, 5))
+  return ok()
+}
 const job = (over: Job = {}): Job => ({
   id: 'j1', agent: 'codex', title: 'Review the branch', ticket: 'ABC-4', status: 'done', permission: 'read-only',
   createdAt: '2026-10-05T11:56:00Z', startedAt: '2026-10-05T11:56:00Z', endedAt: '2026-10-05T12:00:00Z',
@@ -161,6 +170,7 @@ function fakeEngine(state: { jobs: Job[]; calls: string[][]; summary?: string | 
         else if (sub === 'ensure') body = { started: [] }
         else if (sub === 'after' && (state as any).afterError) body = { error: { code: 'bad-after', message: (state as any).afterError } }
         else if (sub === 'draft') body = { sprint: ((state as any).sprints ?? [])[0] }
+        else if (sub === 'note') body = { sprint: ((state as any).sprints ?? [])[0], noted: { key: args[args.indexOf('--ticket') + 1], n: 1, running: Boolean((state as any).noteRunning) } }
         else if (sub === 'start' && (state as any).applied) body = { sprint: ((state as any).sprints ?? [])[0], applied: (state as any).applied }
         else body = { sprints: (state as any).sprints ?? [] }
         break
@@ -171,23 +181,36 @@ function fakeEngine(state: { jobs: Job[]; calls: string[][]; summary?: string | 
   }
 }
 
-// The kit's session.append always fails, so here the hidden details row can never be added: the details
-// go in the visible message after the headline. The hidden-row path (headline only) is tested on the
-// pure helper (tests/mod-delivery.test.js) and in the app.
-test('a finished job whose hidden details row cannot be added goes in as one message, headline first, then is marked delivered', async ($, on) => {
+// The hidden rows the mod appends, each as its text, in `order` beside the submits a test logs there. The kit keeps
+// each row; the test's hook only looks at it on its way.
+function rowsOf(on: any, order: string[] = []) {
+  const rows: string[] = []
+  on('session.append', (_$: any, e: any, next: any) => {
+    rows.push((e.message?.content ?? []).map((b: any) => b.text ?? '').join(''))
+    order.push('row')
+    return typeof next === 'function' ? next(e) : undefined
+  })
+  return rows
+}
+
+// The details go in first as a hidden row, then the headline alone. The paths where the row can't be added (the call
+// throws, or the host has none) and where a plugin refuses it are tested on the pure helper (tests/mod-delivery.test.js).
+test('a finished job\'s details go in as a hidden row, then its headline alone, then it is marked delivered', async ($, on) => {
   on('turn.complete', () => ({ text: '' }))
-    on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
   const state = { jobs: [job()], calls: [] as string[][], summary: 'All fine.\n' }
   const prompts: string[] = []
+  const order: string[] = []
+  const rows = rowsOf(on, order)
   on('process.run', (_$, e) => fakeEngine(state)(e.argv))
-  on('prompt.submit', (_$, e) => { prompts.push(e.text); return { text: e.text } })
+  on('prompt.submit', (_$, e) => { prompts.push(e.text); order.push('submit'); return { text: e.text } })
   await endTurn($)
   await endTurn($)
-  expect(prompts.length).toBe(1)
-  expect(prompts[0].startsWith('Podium: Codex finished "Review the branch".')).toBe(true)
-  expect(prompts[0]).toContain('All fine.')
-  expect(prompts[0]).toContain('Job j1.')
-  expect(prompts[0]).not.toContain('Do not repeat their line')
+  expect(prompts).toEqual(['Podium: Codex finished "Review the branch".'])
+  expect(rows.length).toBe(1)
+  expect(rows[0]).toContain('All fine.')
+  expect(rows[0]).toContain('Job j1.')
+  expect(order).toEqual(['row', 'submit'])
   const claim = state.calls.findIndex((c) => c[0] === 'claim')
   const deliver = state.calls.findIndex((c) => c[0] === 'deliver')
   expect(claim).toBeGreaterThanOrEqual(0)
@@ -204,13 +227,16 @@ test('without a summary, Haiku writes one and the engine stores it', async ($, o
   const heads: string[] = []
   on('process.run', (_$, e) => fakeEngine(state)(e.argv))
   on('model.complete', (_$, e) => { expect(e.model).toBe('haiku'); return { value: { isAnswered: true, text: 'Short summary.', usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } } })
-  on('prompt.submit', (_$, e) => { heads.push(e.text); prompts.push(e.text); return { text: e.text } })
+  const order: string[] = []
+  const rows = rowsOf(on, order)
+  on('prompt.submit', (_$, e) => { heads.push(e.text); prompts.push(e.text); order.push('submit'); return { text: e.text } })
   await endTurn($)
   expect(state.calls.some((c) => c[0] === 'summary')).toBe(true)
-  // The kit has no hidden row, so Haiku's summary rides in the visible message under the headline.
-  expect(prompts.length).toBe(1)
-  expect(prompts[0].startsWith('Podium: Codex finished "Review the branch".')).toBe(true)
-  expect(prompts[0]).toContain('Short summary.')
+  // Haiku's summary rides in the hidden row; the person sees the headline alone.
+  expect(prompts).toEqual(['Podium: Codex finished "Review the branch".'])
+  expect(rows.length).toBe(1)
+  expect(rows[0]).toContain('Short summary.')
+  expect(order).toEqual(['row', 'submit'])
 })
 
 // The lock is renewed from right after the claim, so the time Haiku takes over a summary is covered too.
@@ -236,6 +262,32 @@ test('the delivery lock is renewed from the claim on, while Haiku writes the sum
   expect(renewAt).toBeGreaterThan(claimAt)
   expect(summaryAt).toBeGreaterThan(renewAt)
   expect(state.calls.some((c) => c[0] === 'deliver')).toBe(true)
+})
+
+// The host can start one turn holding several Podium prompts that waited behind a busy one, and settle only the last
+// prompt's submit. A job whose submit never settles is marked once a turn starts holding its headline, and only then.
+test('a finished job whose submit never settles is marked delivered once a turn starts with its headline', async ($, on) => {
+  on('turn.complete', () => ({ text: '' }))
+  on('turn.start', (_$, e: any) => ({ turnId: e.turnId }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  const state = { jobs: [job()], calls: [] as string[][], summary: 'All fine.\n' }
+  const prompts: string[] = []
+  let release = () => {}
+  on('process.run', (_$, e) => fakeEngine(state)(e.argv))
+  on('prompt.submit', (_$, e) => { prompts.push(e.text); return new Promise((resolve) => { release = () => resolve({ text: e.text }) }) })
+  const marked = () => state.calls.filter((c) => c[0] === 'deliver').length
+  const ended = endTurn($)
+  expect(await until(() => prompts.length === 1)).toBe(true)
+  const headline = prompts[0].split('\n')[0]
+  expect(headline).toBe('Podium: Codex finished "Review the branch".')
+  await $.turn.start({ text: 'Podium: Codex finished "Something else".', turnId: 't2' })
+  expect(await until(() => marked() > 0)).toBe(false)
+  await $.turn.start({ text: `The podium plugin sent a message:\nPodium: Codex finished "Something else".\n${headline}`, turnId: 't3' })
+  expect(await until(() => marked() > 0)).toBe(true)
+  release()
+  await ended
+  expect(marked()).toBe(1)
+  expect(state.calls.some((c) => c[0] === 'release')).toBe(false)
 })
 
 test('the dispatch tool sends the task on stdin and reports the permission', async ($, on) => {
@@ -403,7 +455,7 @@ test('Ask Claude about it fills the prompt box and never submits', async ($, on)
   let submitted = 0
   on('process.run', (_$, e) => fakeEngine(state)(e.argv))
   on('fs.read', () => ({ value: liveText('reading src/a.ts') }))
-  on('prompt.fill', (_$, e) => { filled.push(String((e as any).text)); return { value: { isFilled: true } } })
+  on('prompt.fill', (_$, e) => { filled.push(String((e as any).text)); return { isFilled: true } })
   on('prompt.submit', (_$, e) => { submitted++; return { text: (e as any).text } })
   await $.command.run({ command: 'podium', args: '' })
   const pane = await $.ui.mount({ plugin: 'podium', surface: 'desktop', component: 'Pane', props: { title: 'Podium', isFocused: true, bodyColumns: 60 }, requestId: 'podium' })
@@ -694,6 +746,37 @@ test('a chat with no work of its own says so and still offers other chats\' work
   await settle(pane)
   expect(await look(pane, { text: /No jobs in this chat yet/ })).toBeTruthy()
   expect(await look(pane, { type: 'Button', text: /▸ Other chats · 1/ })).toBeTruthy()
+})
+
+// Past the hour another chat's notice is its own chat's alone: this chat doesn't ask for it or get it, and the pane
+// still lists it. (The jobs' default times are days before the kit's clock.)
+test('another chat\'s old notice is listed here but never claimed or told; this chat\'s own and a fresh one are', async ($, on) => {
+  on('turn.complete', () => ({ text: '' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.id', () => ({ value: 'me' }))
+  const fresh = new Date(Date.now() - 10 * 60_000).toISOString()
+  const state = {
+    jobs: [
+      job({ id: 'm-old', title: 'My old review', origin: { session: 'me' } }),
+      job({ id: 'o-old', title: 'Their old review', origin: { session: 'other' } }),
+      job({ id: 'o-new', title: 'Their new review', createdAt: fresh, startedAt: fresh, endedAt: fresh, origin: { session: 'other' } }),
+    ],
+    calls: [] as string[][],
+    summary: 'All fine.\n',
+  }
+  const prompts: string[] = []
+  on('process.run', (_$, e) => fakeEngine(state)(e.argv))
+  on('prompt.submit', (_$, e) => { prompts.push(e.text); return { text: e.text } })
+  await endTurn($)
+  const claimed = state.calls.filter((c) => c[0] === 'claim' && !c.includes('--refresh')).map((c) => c[c.indexOf('--id') + 1])
+  expect(claimed.sort()).toEqual(['m-old', 'o-new'])
+  expect(prompts.length).toBe(2)
+  expect(prompts.some((p) => p.includes('Their old review'))).toBe(false)
+  await $.command.run({ command: 'podium', args: '' })
+  const pane = await $.ui.mount({ plugin: 'podium', surface: 'desktop', component: 'Pane', props: { title: 'Podium', isFocused: true, bodyColumns: 70 }, requestId: 'podium' })
+  await settle(pane)
+  await tap(pane, { key: 'fold-list:others' })
+  expect(await look(pane, { text: /Their old review/ })).toBeTruthy()
 })
 
 // Install path.
@@ -1007,25 +1090,54 @@ for (const surface of ['terminal', 'desktop'] as const) {
   })
 }
 
-// As for jobs, the kit's session.append always fails: the news is claimed for this chat, and one message
-// (headline first, then the details) goes in and is marked delivered.
-test('sprint news is claimed for the sprint\'s chat; with no hidden row the details follow the headline, then it is marked', async ($, on) => {
+// As for jobs: the news is claimed for this chat, its details go in as a hidden row, then the headline alone, and it
+// is marked delivered.
+test('sprint news is claimed for the sprint\'s chat; its details go in as a hidden row, then the headline, then it is marked', async ($, on) => {
   on('turn.complete', () => ({ text: '' }))
   on('session.id', () => ({ value: 'chat-1' }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   const state = { jobs: [] as Job[], calls: [] as string[][], sprints: [{ ...SPRINT, news: 1 }], inbox: [{ id: 's1:1', sprint: 'Oct week 2', text: 'ABC-12 (Payouts) needs you: Review failed twice on task 1\nStill broken.' }] }
   const heads: string[] = []
+  const order: string[] = []
+  const rows = rowsOf(on, order)
   on('process.run', (_$, e) => fakeEngine(state)(e.argv))
-  on('prompt.submit', (_$, e) => { heads.push(e.text); return { text: e.text } })
+  on('prompt.submit', (_$, e) => { heads.push(e.text); order.push('submit'); return { text: e.text } })
   await endTurn($)
   await endTurn($)
   expect(state.calls.some((c) => c[0] === 'sprint' && c[1] === 'inbox' && c.includes('chat-1') && c.includes('--here'))).toBe(true)
-  expect(heads.length).toBe(1)
-  expect(heads[0].startsWith('Podium: ABC-12 (Payouts) needs you: Review failed twice on task 1')).toBe(true)
-  expect(heads[0]).toContain('Still broken.')
-  expect(heads[0]).toContain('[Podium] Sprint updates:')
-  expect(heads[0]).not.toContain('Do not repeat their line')
+  expect(heads).toEqual(['Podium: ABC-12 (Payouts) needs you: Review failed twice on task 1'])
+  expect(rows.length).toBe(1)
+  expect(rows[0]).toContain('[Podium] Sprint updates:')
+  expect(rows[0]).toContain('Still broken.')
+  expect(order).toEqual(['row', 'submit'])
   expect(state.calls.filter((c) => c[0] === 'sprint' && c[1] === 'delivered')).toEqual([['sprint', 'delivered', '--ids', 's1:1']])
+})
+
+// As for a job: sprint news whose submit never settles is marked once a turn starts holding its headline, and the
+// pass lets go, so the next news is told (a stuck pass would hold every later pass off).
+test('sprint news whose submit never settles is marked once a turn starts with it, and the next news still goes in', async ($, on) => {
+  on('turn.complete', () => ({ text: '' }))
+  on('turn.start', (_$, e: any) => ({ turnId: e.turnId }))
+  on('session.id', () => ({ value: 'chat-1' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  const state = { jobs: [] as Job[], calls: [] as string[][], sprints: [{ ...SPRINT, news: 1 }], inbox: [{ id: 's1:1', sprint: 'Oct week 2', text: 'ABC-12 (Payouts) needs you: Review failed twice on task 1' }] }
+  const heads: string[] = []
+  const held: (() => void)[] = []
+  on('process.run', (_$, e) => fakeEngine(state)(e.argv))
+  on('prompt.submit', (_$, e) => { heads.push(e.text); return new Promise((resolve) => { held.push(() => resolve({ text: e.text })) }) })
+  const delivered = () => state.calls.filter((c) => c[0] === 'sprint' && c[1] === 'delivered')
+  const first = endTurn($)
+  expect(await until(() => heads.length === 1)).toBe(true)
+  await $.turn.start({ text: `The podium plugin sent a message:\n${heads[0].split('\n')[0]}`, turnId: 't2' })
+  expect(await until(() => delivered().length === 1)).toBe(true)
+  expect(delivered()[0]).toEqual(['sprint', 'delivered', '--ids', 's1:1'])
+  state.inbox = [{ id: 's1:2', sprint: 'Oct week 2', text: 'ABC-11 (Login form): its plan is ready to approve.' }]
+  const second = endTurn($)
+  expect(await until(() => heads.length === 2)).toBe(true)
+  for (const settle of held) settle()
+  await first
+  await second
+  expect(delivered().map((c) => c[3])).toEqual(['s1:1', 's1:2'])
 })
 
 // Smoke run 2026-10-08: "Podium: 2 sprint updates" made no sense on its own. The headline names each update.
@@ -1039,15 +1151,17 @@ test('a batch of sprint news goes in as one message whose headline names each up
   ]
   const state = { jobs: [] as Job[], calls: [] as string[][], sprints: [{ ...SPRINT, news: 2 }], inbox }
   const heads: string[] = []
+  const order: string[] = []
+  const rows = rowsOf(on, order)
   on('process.run', (_$, e) => fakeEngine(state)(e.argv))
-  on('prompt.submit', (_$, e) => { heads.push(e.text); return { text: e.text } })
+  on('prompt.submit', (_$, e) => { heads.push(e.text); order.push('submit'); return { text: e.text } })
   await endTurn($)
   await endTurn($)
-  expect(heads.length).toBe(1)
-  expect(heads[0].split('\n')[0]).toBe('Podium: ABC-12 (Payouts) needs you: Review failed twice on task 1 · ABC-11 (Login form): its plan is ready to approve')
-  expect(heads[0]).toContain('Still broken.')
-  expect(heads[0]).toContain('The plan is docs/x.md.')
-  expect(heads[0]).not.toContain('sprint updates\n')
+  expect(heads).toEqual(['Podium: ABC-12 (Payouts) needs you: Review failed twice on task 1 · ABC-11 (Login form): its plan is ready to approve'])
+  expect(rows.length).toBe(1)
+  expect(rows[0]).toContain('Still broken.')
+  expect(rows[0]).toContain('The plan is docs/x.md.')
+  expect(order).toEqual(['row', 'submit'])
   expect(state.calls.filter((c) => c[0] === 'sprint' && c[1] === 'delivered')).toEqual([['sprint', 'delivered', '--ids', 's1:1,s1:2']])
 })
 
@@ -1165,8 +1279,8 @@ const task = (n: number, status: string, agent = 'muse', reviewer = 'codex') => 
 const LIVE = {
   id: 's1', name: 'Oct week 2', draft: false, discarded: false, paused: false, finishedAt: null, autoMerge: false, maxParallel: 3, news: 0,
   tickets: [
-    { key: 'ABC-11', title: 'Login form', state: 'running', task: 2, of: 3, phase: 'author', agent: 'muse', reason: null, findings: null, pr: null, reviews: 1, latest: 'sa0', tasks: [task(1, 'done'), task(2, 'current'), task(3, 'to-do')], canRetry: false, giveTo: null, canStop: false },
-    { key: 'ABC-12', title: 'Payouts', state: 'parked', task: 2, of: 2, phase: null, agent: 'muse', reason: 'Review failed twice on task 2', findings: 'Missing test for rounding.', pr: null, reviews: 1, latest: 'sa1', tasks: [task(1, 'done'), { ...task(2, 'current'), canAssign: true }], canRetry: true, giveTo: 'reviewer', canStop: true },
+    { key: 'ABC-11', title: 'Login form', state: 'running', task: 2, of: 3, phase: 'author', agent: 'muse', reason: null, findings: null, pr: null, reviews: 1, latest: 'sa0', tasks: [task(1, 'done'), task(2, 'current'), task(3, 'to-do')], canRetry: false, giveTo: null, canStop: false, canNote: true },
+    { key: 'ABC-12', title: 'Payouts', state: 'parked', task: 2, of: 2, phase: null, agent: 'muse', reason: 'Review failed twice on task 2', findings: 'Missing test for rounding.', pr: null, reviews: 1, latest: 'sa1', tasks: [task(1, 'done'), { ...task(2, 'current'), canAssign: true }], canRetry: true, giveTo: 'reviewer', canStop: true, canNote: true },
   ],
 }
 const DRAFT = {
@@ -1181,14 +1295,14 @@ const planTicket = (over: Record<string, unknown> = {}) => ({
   key: 'ABC-31', title: 'Export to CSV', state: 'plan-ready', task: 0, of: 0, phase: null, agent: 'muse', reason: null, findings: null, pr: null, reviews: 0,
   latest: 'sp1', tasks: [], canRetry: false, giveTo: null, canStop: true,
   plan: 'docs/plans/2026-10-07-abc-31-export-to-csv.md', writer: 'muse', reviewer: 'codex', canAssignPlan: true, after: [], waitingOn: [],
-  proposed: [{ n: 1, title: 'Add the export button' }, { n: 2, title: 'Write the CSV' }], canApprove: true, canRevise: true, canOneTask: false, ...over,
+  proposed: [{ n: 1, title: 'Add the export button' }, { n: 2, title: 'Write the CSV' }], canApprove: true, canRevise: true, canOneTask: false, canNote: true, ...over,
 })
 const PLANS = {
   ...LIVE, id: 's3', name: 'Oct week 4',
   tickets: [
     planTicket(),
     planTicket({ key: 'ABC-32', title: 'Import', state: 'no-tasks', reason: "Couldn't find tasks in this plan", plan: 'docs/plans/2026-10-07-abc-32-import.md', proposed: null, canApprove: false, canOneTask: true }),
-    { key: 'ABC-33', title: 'Reports', state: 'pending', task: 1, of: 1, phase: null, agent: 'muse', reason: null, findings: null, pr: null, reviews: 0, latest: null, tasks: [task(1, 'to-do')], canRetry: false, giveTo: null, canStop: true, after: ['ABC-31'], waitingOn: ['ABC-31'] },
+    { key: 'ABC-33', title: 'Reports', state: 'pending', task: 1, of: 1, phase: null, agent: 'muse', reason: null, findings: null, pr: null, reviews: 0, latest: null, tasks: [task(1, 'to-do')], canRetry: false, giveTo: null, canStop: true, canNote: true, after: ['ABC-31'], waitingOn: ['ABC-31'] },
   ],
 }
 const PLANLESS = {
@@ -2374,6 +2488,116 @@ for (const surface of ['terminal', 'desktop'] as const) {
 }
 
 for (const surface of ['terminal', 'desktop'] as const) {
+  test(`a ticket takes a note from its screen: the form is the one decision, Save hands it over, and Your notes folds them, on ${surface}`, async ($, on) => {
+    on('ui.open', () => ({ value: { isPlaced: true } }))
+    const parked = { ...LIVE.tickets[1], notes: [{ n: 4, at: '2026-10-14T15:00:00.000Z', text: 'Rounding goes half-up.' }], noteCount: 4 }
+    const state: any = { jobs: [] as Job[], calls: [] as string[][], sprints: [{ ...LIVE, tickets: [LIVE.tickets[0], parked] }] }
+    const sent: string[] = []
+    on('process.run', (_$, e) => { if (e.argv[2] === 'sprint' && e.argv[3] === 'note') sent.push(String(e.init?.stdin)); return fakeEngine(state)(e.argv) })
+    await $.command.run({ command: 'podium', args: '' })
+    const pane = await $.ui.mount({ plugin: 'podium', surface, component: 'Pane', props: { title: 'Podium', isFocused: true, bodyColumns: 100 }, requestId: 'podium' })
+    await settle(pane)
+    await tap(pane, { key: 'open-board-s1' })
+    await openTicketOf(pane, 'ABC-12')
+    // Closed by default, the notes fold says how many; open, the latest and how many more.
+    expect(await look(pane, { text: /^1\. Rounding goes half-up\.$/ })).toBeFalsy()
+    await tap(pane, { key: 'fold-ticket:s1:ABC-12:notes' })
+    expect(await look(pane, { text: /^4\. Rounding goes half-up\.$/ })).toBeTruthy()
+    expect(await look(pane, { text: /^3 older not shown here$/ })).toBeTruthy()
+    // The form: the one decision while it is open, and Save with nothing typed sends nothing.
+    expect(await primaryKeys(pane)).toEqual(['retry-ABC-12'])
+    await tap(pane, { key: 'link-note-ABC-12' })
+    expect(await primaryKeys(pane)).toEqual(['note-save-ABC-12'])
+    expect(await look(pane, { key: 'link-note-ABC-12' })).toBeFalsy()
+    expect(await look(pane, { text: /^Every later planner, writer and reviewer of ABC-12 reads it\.$/ })).toBeTruthy()
+    await tap(pane, { key: 'note-save-ABC-12' })
+    expect(await look(pane, { text: /^Write the note first\.$/ })).toBeTruthy()
+    expect(sent).toEqual([])
+    // Cancel brings the next step back.
+    await tap(pane, { key: 'note-cancel-ABC-12' })
+    expect(await primaryKeys(pane)).toEqual(['retry-ABC-12'])
+    await tap(pane, { key: 'link-note-ABC-12' })
+    await type(pane, { key: 'note-text-ABC-12', text: 'Leave the date tests alone.' })
+    expect(said(state, 'sprint note --id s1 --ticket ABC-12 --text -')).toBe(true)
+    expect(sent).toEqual(['Leave the date tests alone.'])
+    expect(await look(pane, { text: /^Noted on ABC-12\. Every later planner, writer and reviewer of ABC-12 reads it\.$/ })).toBeTruthy()
+    expect(await look(pane, { key: 'note-text-ABC-12' })).toBeFalsy()
+    expect(await primaryKeys(pane)).toEqual(['retry-ABC-12'])
+    // A running ticket's form says the step running now won't see it.
+    await tap(pane, { key: 'back' })
+    await openTicketOf(pane, 'ABC-11')
+    await tap(pane, { key: 'link-note-ABC-11' })
+    expect(await look(pane, { text: /^The step running now won't see it; every later step of ABC-11 will\.$/ })).toBeTruthy()
+    state.noteRunning = true
+    await type(pane, { key: 'note-text-ABC-11', text: 'Keep the old API.' })
+    expect(await look(pane, { text: /^Noted on ABC-11\. The step running now won't see it; every later step of ABC-11 will\.$/ })).toBeTruthy()
+    await pane.unmount()
+  })
+}
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`a ticket stopped on its tests says where they ran, and Accept and continue takes the person's reason, on ${surface}`, async ($, on) => {
+    on('ui.open', () => ({ value: { isPlaced: true } }))
+    const parked = { ...LIVE.tickets[1], reason: "Task 2's tests failed in Muse's sandbox", findings: '2 failing', canAccept: true, testsWhere: 'sandbox' }
+    const state: any = { jobs: [] as Job[], calls: [] as string[][], sprints: [{ ...LIVE, tickets: [LIVE.tickets[0], parked] }] }
+    const sent: string[] = []
+    on('process.run', (_$, e) => { if (e.argv[2] === 'sprint' && e.argv[3] === 'accept') sent.push(String(e.init?.stdin)); return fakeEngine(state)(e.argv) })
+    await $.command.run({ command: 'podium', args: '' })
+    const pane = await $.ui.mount({ plugin: 'podium', surface, component: 'Pane', props: { title: 'Podium', isFocused: true, bodyColumns: 100 }, requestId: 'podium' })
+    await settle(pane)
+    await tap(pane, { key: 'open-board-s1' })
+    await openTicketOf(pane, 'ABC-12')
+    expect(await look(pane, { text: /^These ran in Muse's sandbox, not on this machine\./ })).toBeTruthy()
+    expect(await primaryKeys(pane)).toEqual(['retry-ABC-12'])
+    await tap(pane, { key: 'accept-ABC-12' })
+    // The form is the one decision; it says who reviews next.
+    expect(await primaryKeys(pane)).toEqual(['accept-save-ABC-12'])
+    expect(await look(pane, { key: 'accept-ABC-12' })).toBeFalsy()
+    expect(await look(pane, { text: /^Codex reviews it next, told what you said and not to fail it for these results\.$/ })).toBeTruthy()
+    await tap(pane, { key: 'accept-save-ABC-12' })
+    expect(await look(pane, { text: /^Say why the test results are fine first\.$/ })).toBeTruthy()
+    expect(sent).toEqual([])
+    await tap(pane, { key: 'accept-cancel-ABC-12' })
+    expect(await primaryKeys(pane)).toEqual(['retry-ABC-12'])
+    await tap(pane, { key: 'accept-ABC-12' })
+    await type(pane, { key: 'accept-text-ABC-12', text: 'The date tests fail on main too.' })
+    expect(said(state, 'sprint accept --id s1 --ticket ABC-12 --text -')).toBe(true)
+    expect(sent).toEqual(['The date tests fail on main too.'])
+    expect(await look(pane, { text: /^Accepted: ABC-12's task goes to its review\.$/ })).toBeTruthy()
+    expect(await look(pane, { key: 'accept-text-ABC-12' })).toBeFalsy()
+    await pane.unmount()
+  })
+}
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`a ticket stopped on a failed review can be reviewed again with the person's evidence, on ${surface}`, async ($, on) => {
+    on('ui.open', () => ({ value: { isPlaced: true } }))
+    const parked = { ...LIVE.tickets[1], reason: 'Review failed twice on task 2', canEvidence: true }
+    const state: any = { jobs: [] as Job[], calls: [] as string[][], sprints: [{ ...LIVE, tickets: [LIVE.tickets[0], parked] }] }
+    const sent: string[] = []
+    on('process.run', (_$, e) => { if (e.argv[2] === 'sprint' && e.argv[3] === 'evidence') sent.push(String(e.init?.stdin)); return fakeEngine(state)(e.argv) })
+    await $.command.run({ command: 'podium', args: '' })
+    const pane = await $.ui.mount({ plugin: 'podium', surface, component: 'Pane', props: { title: 'Podium', isFocused: true, bodyColumns: 100 }, requestId: 'podium' })
+    await settle(pane)
+    await tap(pane, { key: 'open-board-s1' })
+    await openTicketOf(pane, 'ABC-12')
+    expect(await primaryKeys(pane)).toEqual(['retry-ABC-12'])
+    await tap(pane, { key: 'evidence-ABC-12' })
+    expect(await primaryKeys(pane)).toEqual(['evidence-save-ABC-12'])
+    expect(await look(pane, { text: /^Codex reviews it again, weighing this before failing it for tests it couldn't run\.$/ })).toBeTruthy()
+    await tap(pane, { key: 'evidence-save-ABC-12' })
+    expect(await look(pane, { text: /^Say what the reviewer should weigh first\.$/ })).toBeTruthy()
+    expect(sent).toEqual([])
+    await type(pane, { key: 'evidence-text-ABC-12', text: 'CI passed on Linux: https://ci/1' })
+    expect(said(state, 'sprint evidence --id s1 --ticket ABC-12 --text -')).toBe(true)
+    expect(sent).toEqual(['CI passed on Linux: https://ci/1'])
+    expect(await look(pane, { text: /^ABC-12's task goes back to its review with your evidence\.$/ })).toBeTruthy()
+    expect(await look(pane, { key: 'evidence-text-ABC-12' })).toBeFalsy()
+    await pane.unmount()
+  })
+}
+
+for (const surface of ['terminal', 'desktop'] as const) {
   test(`an "after" the engine refuses as a loop shows the engine's words on the board, on ${surface}`, async ($, on) => {
     on('ui.open', () => ({ value: { isPlaced: true } }))
     const message = 'These tickets wait for each other, so none of them could start: ABC-41 → ABC-42 → ABC-41.'
@@ -2938,6 +3162,59 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await pane.unmount()
   })
 
+  test(`a plan that runs a production command lists it, and Approve asks first, on ${surface}`, async ($, on) => {
+    const attention = [{ n: 2, command: 'supabase functions delete export-v1 --project-ref live' }]
+    const state = { jobs: [] as Job[], calls: [] as string[][], sprints: [{ ...PLANS, tickets: [planTicket({ attention }), ...PLANS.tickets.slice(1)] }] }
+    const pane = await mountOn($, on, surface, state)
+    await openTicketScreen(pane, 's3', 'ABC-31')
+    const text = await drawnText(pane)
+    expect(text).toContain('Plan ready · check it, then approve · needs your attention')
+    expect(text).toContain('Needs your attention: this plan runs a production command:')
+    expect(text).toContain('· Task 2: supabase functions delete export-v1 --project-ref live')
+    expect(await primaryKeys(pane)).toEqual(['approve-ABC-31'])
+    await tap(pane, { key: 'approve-ABC-31' })
+    expect(said(state, 'sprint approve --id s3 --ticket ABC-31')).toBe(false)
+    expect(await primaryKeys(pane)).toEqual(['ack-yes-ABC-31'])
+    expect(await drawnText(pane)).toContain('The agent will run that command as the plan says. Approve the plan anyway?')
+    await tap(pane, { key: 'ack-no-ABC-31' })
+    expect(await primaryKeys(pane)).toEqual(['approve-ABC-31'])
+    await tap(pane, { key: 'approve-ABC-31' })
+    await tap(pane, { key: 'ack-yes-ABC-31' })
+    expect(said(state, 'sprint approve --id s3 --ticket ABC-31 --acknowledge')).toBe(true)
+    await pane.unmount()
+  })
+
+  test(`with only the count of a plan's production commands, the pane sends the person to Claude and never agrees for them, on ${surface}`, async ($, on) => {
+    const state = { jobs: [] as Job[], calls: [] as string[][], sprints: [{ ...PLANS, tickets: [planTicket({ attentionCount: 2 }), ...PLANS.tickets.slice(1)] }] }
+    const pane = await mountOn($, on, surface, state)
+    await openTicketScreen(pane, 's3', 'ABC-31')
+    expect(await drawnText(pane)).toContain('Needs your attention: this plan runs 2 production commands.')
+    await tap(pane, { key: 'approve-ABC-31' })
+    expect(await drawnText(pane)).toContain('Not all of its 2 production commands are shown here. Ask Claude to list them, and approve there once you agree.')
+    expect(await look(pane, { key: 'ack-yes-ABC-31' })).toBeFalsy()
+    expect(await primaryKeys(pane)).toEqual([])
+    await tap(pane, { key: 'ack-no-ABC-31' })
+    expect(await primaryKeys(pane)).toEqual(['approve-ABC-31'])
+    expect(state.calls.some((c) => c[0] === 'sprint' && c[1] === 'approve')).toBe(false)
+    await pane.unmount()
+  })
+
+  test(`a plan with more production commands than the screen lists says how many more, and the pane never agrees for them, on ${surface}`, async ($, on) => {
+    const attention = [{ n: 1, command: 'git push origin main' }]
+    const state = { jobs: [] as Job[], calls: [] as string[][], sprints: [{ ...PLANS, tickets: [planTicket({ attention, attentionMore: 4 }), ...PLANS.tickets.slice(1)] }] }
+    const pane = await mountOn($, on, surface, state)
+    await openTicketScreen(pane, 's3', 'ABC-31')
+    const text = await drawnText(pane)
+    expect(text).toContain('Needs your attention: this plan runs 5 production commands:')
+    expect(text).toContain('· Task 1: git push origin main')
+    expect(text).toContain('… and 4 more in the plan')
+    await tap(pane, { key: 'approve-ABC-31' })
+    expect(await drawnText(pane)).toContain('Not all of its 5 production commands are shown here. Ask Claude to list them, and approve there once you agree.')
+    expect(await look(pane, { key: 'ack-yes-ABC-31' })).toBeFalsy()
+    expect(state.calls.some((c) => c[0] === 'sprint' && c[1] === 'approve')).toBe(false)
+    await pane.unmount()
+  })
+
   test(`a parked ticket's Stop question stands alone: Retry is back after Cancel, on ${surface}`, async ($, on) => {
     const state = { jobs: [] as Job[], calls: [] as string[][], sprints: [LIVE] }
     const pane = await mountOn($, on, surface, state)
@@ -2948,6 +3225,39 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await look(pane, { key: 'retry-ABC-12' })).toBeFalsy()
     await tap(pane, { key: 'stop-no-ABC-12' })
     expect(await primaryKeys(pane)).toEqual(['retry-ABC-12'])
+    await pane.unmount()
+  })
+
+  test(`a ticket's copy can take its base, and commits Podium didn't make wait for Keep or Drop, whose question stands alone, on ${surface}`, async ($, on) => {
+    const parked = LIVE.tickets[1]
+    const SYNCING = {
+      ...LIVE, id: 's5', base: 'main',
+      tickets: [
+        { ...parked, key: 'ABC-51', reason: 'The full check failed before the PR', giveTo: 'writer', canSync: true },
+        { ...parked, key: 'ABC-52', reason: "A commit in this ticket's copy was not made by Podium (newest: abc1234 Fixed by hand). Keep it and Podium carries on from it, or drop it.", canRetry: false, giveTo: null, foreignCommits: { count: 1, newest: 'abc1234 Fixed by hand' } },
+      ],
+    }
+    const state = { jobs: [] as Job[], calls: [] as string[][], sprints: [SYNCING] }
+    const pane = await mountOn($, on, surface, state)
+    await openTicketScreen(pane, 's5', 'ABC-51')
+    expect(await primaryKeys(pane)).toEqual(['retry-ABC-51'])
+    await tap(pane, { key: 'sync-ABC-51' })
+    expect(said(state, 'sprint sync --id s5 --ticket ABC-51')).toBe(true)
+    await tap(pane, { key: 'back' })
+    await openTicketOf(pane, 'ABC-52')
+    expect(await primaryKeys(pane)).toEqual(['keep-commits-ABC-52'])
+    expect(await look(pane, { key: 'retry-ABC-52' })).toBeFalsy()
+    expect(await look(pane, { key: 'sync-ABC-52' })).toBeFalsy()
+    await tap(pane, { key: 'end-drop-commits-ABC-52' })
+    expect(await primaryKeys(pane)).toEqual(['drop-yes-ABC-52'])
+    expect(await look(pane, { key: 'keep-commits-ABC-52' })).toBeFalsy()
+    await tap(pane, { key: 'drop-no-ABC-52' })
+    expect(await primaryKeys(pane)).toEqual(['keep-commits-ABC-52'])
+    await tap(pane, { key: 'keep-commits-ABC-52' })
+    expect(said(state, 'sprint commits --id s5 --ticket ABC-52 --answer keep')).toBe(true)
+    await tap(pane, { key: 'end-drop-commits-ABC-52' })
+    await tap(pane, { key: 'drop-yes-ABC-52' })
+    expect(said(state, 'sprint commits --id s5 --ticket ABC-52 --answer drop')).toBe(true)
     await pane.unmount()
   })
 }
@@ -3188,6 +3498,55 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(said(state, 'sprint stop --id s1 --ticket ABC-12')).toBe(false)
     await tap(pane, { key: 'stop-yes-ABC-12' })
     expect(said(state, 'sprint stop --id s1 --ticket ABC-12')).toBe(true)
+    await pane.unmount()
+  })
+
+  test(`a ticket parked on a locked file says what to release and retries with the existing action, on ${surface}`, async ($, on) => {
+    const base = LIVE.tickets[1]
+    const plain = { ...base, key: 'ABC-12', title: 'Payouts', reason: "Podium couldn't finish saving changes because held.dll is still open in a program. Close the program holding the file, then Retry. The ticket's copy and any stash Git made have been kept.", findings: null, checkpointLock: { file: 'held.dll', hint: null, stashBefore: null, stashAfter: 'abc1234' } }
+    const dotnet = { ...base, key: 'ABC-13', title: 'Ledger', reason: "Podium couldn't finish saving changes because .review-tmp/VBCSCompiler/x.dll is still open in a program. Close the program holding the file, then Retry. The ticket's copy and any stash Git made have been kept. For a .NET compiler server, run dotnet build-server shutdown in this ticket's copy, then Retry.", findings: null, checkpointLock: { file: '.review-tmp/VBCSCompiler/x.dll', hint: 'dotnet', stashBefore: null, stashAfter: 'abc1234' } }
+    const ordinary = { ...base, key: 'ABC-14', title: 'Export' }
+    const state: any = { jobs: [] as Job[], calls: [] as string[][], sprints: [{ ...LIVE, tickets: [LIVE.tickets[0], plain, dotnet, ordinary] }] }
+    const pane = await mountOn($, on, surface, state)
+    // An ordinary park keeps its controls and shows no release flow.
+    await openTicketScreen(pane, 's1', 'ABC-14')
+    expect(await look(pane, { text: /^Release and retry$/ })).toBeFalsy()
+    expect(await look(pane, { type: 'Button', text: /^\s*Retry\s*$/ })).toBeTruthy()
+    expect(await look(pane, { text: /I've released it/ })).toBeFalsy()
+    expect(await primaryKeys(pane)).toEqual(['retry-ABC-14'])
+    // A locked file without the .NET hint: the file, what to do, and that the copy and stash were kept.
+    await tap(pane, { key: 'back' })
+    await openTicketOf(pane, 'ABC-12')
+    expect(await look(pane, { text: /^Release and retry$/ })).toBeTruthy()
+    const text = await drawnText(pane)
+    expect(text).toContain('held.dll is still open in a program')
+    expect(text).toContain("Close the program holding the file, then press I've released it — Retry")
+    expect(text).toContain("The ticket's copy and any stash Git made have been kept")
+    expect(text).not.toContain('dotnet build-server shutdown')
+    // The original failure details stay for inspection.
+    expect(await look(pane, { text: /Podium couldn't finish saving changes because/ })).toBeTruthy()
+    // One primary action: the existing Retry with its release label.
+    expect(await primaryKeys(pane)).toEqual(['retry-ABC-12'])
+    expect(await look(pane, { type: 'Button', text: /I've released it — Retry/ })).toBeTruthy()
+    // The .NET hint names the compiler-server command.
+    await tap(pane, { key: 'back' })
+    await openTicketOf(pane, 'ABC-13')
+    expect(await drawnText(pane)).toContain('dotnet build-server shutdown in this ticket\'s copy')
+    expect(await primaryKeys(pane)).toEqual(['retry-ABC-13'])
+    // It calls only the existing Retry action.
+    await tap(pane, { key: 'retry-ABC-13' })
+    expect(said(state, 'sprint retry --id s1 --ticket ABC-13')).toBe(true)
+    // After Retry the engine clears the field: the instructions are gone and the button reads Retry again.
+    const { checkpointLock: _dropped, ...retried } = dotnet
+    state.sprints = [{ ...LIVE, tickets: [LIVE.tickets[0], plain, { ...retried, state: 'waiting', reason: 'Trying again: Muse does task 2' }, ordinary] }]
+    await $.command.run({ command: 'podium', args: 'status' })
+    await settle(pane)
+    expect(await look(pane, { text: /^Release and retry$/ })).toBeFalsy()
+    expect(await look(pane, { type: 'Button', text: /^\s*Retry\s*$/ })).toBeTruthy()
+    // The other locked ticket still shows its own instructions.
+    await tap(pane, { key: 'back' })
+    await openTicketOf(pane, 'ABC-12')
+    expect(await look(pane, { text: /^Release and retry$/ })).toBeTruthy()
     await pane.unmount()
   })
 
@@ -3705,10 +4064,41 @@ test('Settings → This repo: its heading says what is set, and each field saves
   expect(await look(pane, { type: 'Button', text: /▾ This repo · dotnet/ })).toBeTruthy()
   await type(pane, { key: 'repo-check', text: 'dotnet build && dotnet test' })
   expect(said(state, 'settings set --key repoCheck --value {"repo":"dotnet build && dotnet test"}')).toBe(true)
+  await type(pane, { key: 'repo-task-test', text: 'dotnet test' })
+  expect(said(state, 'settings set --key repoTaskTest --value {"repo":"dotnet test"}')).toBe(true)
   await tap(pane, { key: 'repo-squash' })
   expect(said(state, 'settings set --key repoSquash --value {"repo":false}')).toBe(true)
   await tap(pane, { key: 'repo-merge-squash' })
   expect(said(state, 'settings set --key repoMergeMethod --value {"repo":"squash"}')).toBe(true)
+  await pane.unmount()
+})
+
+test('Settings → This repo: keeping sprint plans in the PR is off until pressed, and pressing it again removes it', async ($, on) => {
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  const state: any = { jobs: [] as Job[], calls: [] as string[][] }
+  on('process.run', (_$, e) => fakeEngine(state)(e.argv))
+  await $.command.run({ command: 'podium', args: '' })
+  const pane = await mountPane($)
+  await tap(pane, { key: 'link-settings' })
+  await tap(pane, { key: 'fold-settings:repo' })
+  expect(await look(pane, { type: 'Button', text: /^☐ Keep sprint plans in the PR$/ })).toBeTruthy()
+  await tap(pane, { key: 'repo-keep-plan' })
+  expect(said(state, 'settings set --key repoKeepPlan --value {"repo":true}')).toBe(true)
+  await pane.unmount()
+})
+
+test('Settings → This repo: with plans kept in PRs, the heading says so, the box is ticked, and pressing it removes it', async ($, on) => {
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  const state: any = { jobs: [] as Job[], calls: [] as string[][], saved: { repoKeepPlan: { repo: true } } }
+  on('process.run', (_$, e) => fakeEngine(state)(e.argv))
+  await $.command.run({ command: 'podium', args: '' })
+  const pane = await mountPane($)
+  await tap(pane, { key: 'link-settings' })
+  expect(await look(pane, { type: 'Button', text: /▸ This repo · plans kept in PRs/ })).toBeTruthy()
+  await tap(pane, { key: 'fold-settings:repo' })
+  expect(await look(pane, { type: 'Button', text: /^☑ Keep sprint plans in the PR$/ })).toBeTruthy()
+  await tap(pane, { key: 'repo-keep-plan' })
+  expect(said(state, 'settings set --key repoKeepPlan --value {}')).toBe(true)
   await pane.unmount()
 })
 
@@ -3761,6 +4151,22 @@ test('a draft board folds what Claude proposed for the repo, draws no more words
   await tap(pane, { key: 'board-start' })
   expect(said(state, 'sprint start --id s2')).toBe(true)
   expect(await look(pane, { type: 'Text', text: /^Started\. Saved for this repo: commands dotnet; full check "dotnet build && dotnet test"\.$/ })).toBeTruthy()
+  await pane.unmount()
+})
+
+test('a draft board\'s This repo fold says when Claude proposed keeping plans in PRs', async ($, on) => {
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.id', () => ({ value: 'chat-1' }))
+  const state: any = { jobs: [] as Job[], calls: [] as string[][], sprints: [{ ...DRAFT, check: true, proposed: { keepPlan: true } }], doctor: GH_READY }
+  on('process.run', (_$, e) => fakeEngine(state)(e.argv))
+  await $.command.run({ command: 'podium', args: '' })
+  const pane = await mountPane($)
+  await settle(pane)
+  await tap(pane, { key: 'open-board-s2' })
+  expect(await look(pane, { type: 'Button', text: /^▸ This repo · plans in PRs$/ })).toBeTruthy()
+  expect(await look(pane, { type: 'Text', text: /^Plans: kept in each PR$/ })).toBeFalsy()
+  await tap(pane, { key: 'fold-board:s2:repo' })
+  expect(await look(pane, { type: 'Text', text: /^Plans: kept in each PR$/ })).toBeTruthy()
   await pane.unmount()
 })
 

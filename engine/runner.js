@@ -13,8 +13,28 @@ import { outcomePatch } from './outcome.js';
 import { createLiveWriter } from './live.js';
 import { changeSummary } from './changes.js';
 import { loadSettings, repoSettings } from './settings.js';
+import { PodiumError } from './errors.js';
+import { copyBuildEnv } from './build-env.js';
 
 export const SANDBOX_BROKEN = /sandbox enforcement unavailable|SetNamedSecurityInfoW failed/i;
+
+// A sprint reviewer working in its ticket's copy (scratchTmp) gets a temp folder of its own in the job's folder: writable
+// (a read-only sandbox once failed tests that make temp folders; an agent's write sandbox lets it write its TMPDIR), and
+// outside any git repo, as tests that make fixture repos there expect. Preparation must succeed before the agent starts;
+// inheriting a temp folder inside the copy could leave locked files in a checkpoint. Cleanup is best effort (dropScratch).
+const scratchOf = (dir) => path.join(dir, 'tmp');
+export function tempEnv(job, dir, { mkdir = fs.mkdirSync } = {}) {
+  if (!job.scratchTmp) return {};
+  const tmp = path.resolve(scratchOf(dir));
+  try { mkdir(tmp, { recursive: true }); }
+  catch (cause) {
+    throw new PodiumError('review-temp-unavailable',
+      `Podium couldn't create the review's temporary folder at ${tmp}. Check that the job folder is writable, then Retry.`,
+      { cause: cause.code ?? cause.message });
+  }
+  return { TMPDIR: tmp, TEMP: tmp, TMP: tmp };
+}
+const dropScratch = (job, dir) => { if (job.scratchTmp) fs.rmSync(scratchOf(dir), { recursive: true, force: true }); };
 
 async function runAgent(root, job, adapter, dir, session) {
   const promptFile = path.join(dir, 'prompt.md');
@@ -23,13 +43,14 @@ async function runAgent(root, job, adapter, dir, session) {
   const allow = job.worktree ? repoSettings(loadSettings(root), job.project).commands : [];
   const invocation = buildInvocation(adapter, { permission: job.permission, model: job.model, promptFile, session, allow });
   const line = commandLine(invocation.command, invocation.args);
+  const env = { ...(job.worktree ? copyBuildEnv() : process.env), PODIUM_JOB_ID: job.id, ...tempEnv(job, dir) };
 
   const out = fs.createWriteStream(path.join(dir, 'output.md'), { flags: 'a' });
   const err = fs.createWriteStream(path.join(dir, 'stderr.log'), { flags: 'a' });
   const started = Date.now();
   const child = spawn(line.file, line.argv, {
     cwd: job.worktree || job.cwd,
-    env: { ...process.env, PODIUM_JOB_ID: job.id },
+    env,
     windowsVerbatimArguments: line.verbatim,
     windowsHide: true,
   });
@@ -75,7 +96,10 @@ export async function runJob(root, dir) {
   }
   const first = await runAgent(root, job, adapter, dir, session);
   // A cancel must also prevent a fresh run after a failed resume.
-  if (readJob(dir).status === 'cancelled') return readJob(dir);
+  if (readJob(dir).status === 'cancelled') {
+    try { dropScratch(job, dir); } catch { /* External files still held open may remain; they cannot block the copy's next checkpoint. */ }
+    return readJob(dir);
+  }
   let second = null;
   let activeSession = session;
   let resumeFailed = false;
@@ -97,9 +121,13 @@ export async function runJob(root, dir) {
 
   // Re-read: a cancel may have landed while the agent ran.
   const current = readJob(dir);
-  if (current.status === 'cancelled') return current;
+  if (current.status === 'cancelled') {
+    try { dropScratch(job, dir); } catch { /* External files still held open may remain; they cannot block the copy's next checkpoint. */ }
+    return current;
+  }
 
   Object.assign(patch, { endedAt: new Date().toISOString(), exitCode: code });
+  try { dropScratch(job, dir); } catch { /* A locked external file can wait for later job-folder cleanup without blocking progress. */ }
   if (job.worktree) {
     const since = current.startedAt ? new Date(Date.parse(current.startedAt) - 2000).toISOString() : null;
     const committed = await committedWork(job.worktree, { baseCommit: job.baseCommit, branch: job.branch, since }).catch(() => null);

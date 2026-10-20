@@ -3,6 +3,7 @@ import path from 'node:path';
 import { readJson, writeJsonAtomic } from './fsutil.js';
 import { newJobId } from './ids.js';
 import { PodiumError } from './errors.js';
+import { inProject, projectFolders } from './paths.js';
 
 export const TERMINAL = new Set(['done', 'needs-review', 'failed', 'cancelled', 'lost', 'kept', 'discarded', 'continued', 'in-review', 'merged', 'closed']);
 
@@ -57,11 +58,12 @@ export function updateJob(root, dir, patch, event) {
   return job;
 }
 
+// project: a key, a projectHere (paths.js), or none for every project.
 export function listJobDirs(root, { project, ticket } = {}) {
   const base = jobsRoot(root);
   if (!isDir(base)) return [];
   const dirs = [];
-  for (const p of project ? [project] : fs.readdirSync(base)) {
+  for (const p of project ? projectFolders(project) : fs.readdirSync(base)) {
     const pdir = path.join(base, p);
     if (!isDir(pdir)) continue;
     for (const t of ticket ? [ticket] : fs.readdirSync(pdir)) {
@@ -69,11 +71,18 @@ export function listJobDirs(root, { project, ticket } = {}) {
       if (!isDir(tdir)) continue;
       for (const id of fs.readdirSync(tdir)) {
         const d = path.join(tdir, id);
-        if (fs.existsSync(path.join(d, 'job.json'))) dirs.push(d);
+        if (!fs.existsSync(path.join(d, 'job.json'))) continue;
+        // Under a worktree's older key, only the jobs made in that worktree.
+        if (project && typeof project === 'object' && p !== project.key && !inProject(project, p, cwdOf(d))) continue;
+        dirs.push(d);
       }
     }
   }
   return dirs.sort((a, b) => path.basename(b).localeCompare(path.basename(a)));
+}
+
+function cwdOf(dir) {
+  try { return readJson(path.join(dir, 'job.json')).cwd; } catch { return null; }
 }
 
 export function findJobDir(root, id) {

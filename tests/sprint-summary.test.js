@@ -4,13 +4,40 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Writable } from 'node:stream';
-import { draftSprint, startSprint, createSprint, loadSprint, saveSprint, tick, sprintSummary, sprintSummaries, claimMessages, archiveEnded, setReadHook } from '../engine/sprint.js';
+import { draftSprint, startSprint, createSprint, loadSprint, saveSprint, tick, sprintSummary, sprintSummaries, claimMessages, archiveEnded, setReadHook, retryTicket, stopTicket } from '../engine/sprint.js';
 import { ensureSprints } from '../engine/sprint-run.js';
 import { main } from '../engine/cli.js';
 import { scriptAgent, sprintWorld } from './helpers.js';
 import { setSetting } from '../engine/settings.js';
+import { listJobDirs, readJob } from '../engine/store.js';
 
 const T = (over = {}) => ({ key: 'ABC-11', title: 'Login form', type: 'feat', plan: 'docs/plan.md', agent: 'fa', reviewer: 'fr', ...over });
+
+test('checkpointLock is optional and only exposed for its matching parked state', async () => {
+  const { root, w } = sprintWorld();
+  for (const name of ['fa', 'fr']) scriptAgent(root, name, []);
+  const s = await createSprint(root, { name: 'locks', tickets: [T()] }, { cwd: w.repo });
+  const t = s.tickets[0];
+  const { checkpointLockMessage } = await import('../engine/file-locks.js');
+  const lock = { file: 'held.txt', hint: null, stashBefore: null, stashAfter: null };
+  assert.equal('checkpointLock' in sprintSummary(root, s).tickets[0], false, 'old records');
+  Object.assign(t, { state: 'parked', checkpointLock: lock, reason: checkpointLockMessage(lock) });
+  assert.deepEqual(sprintSummary(root, s).tickets[0].checkpointLock, lock);
+  for (const state of ['waiting', 'running', 'stopped', 'pr-open']) {
+    t.state = state;
+    assert.equal('checkpointLock' in sprintSummary(root, s).tickets[0], false, state);
+  }
+  t.state = 'parked'; t.reason = 'An unrelated failure';
+  assert.equal('checkpointLock' in sprintSummary(root, s).tickets[0], false);
+  saveSprint(root, s);
+  const retry = await retryTicket(root, s.id, t.key);
+  assert.equal(retry.tickets[0].checkpointLock, undefined);
+  Object.assign(retry.tickets[0], { state: 'parked', checkpointLock: lock, reason: checkpointLockMessage(lock) });
+  saveSprint(root, retry);
+  const stopped = await stopTicket(root, s.id, t.key);
+  assert.equal(stopped.tickets[0].checkpointLock, undefined);
+  assert.equal('checkpointLock' in sprintSummary(root, stopped).tickets[0], false);
+});
 
 async function cli(root, argv, cwd) {
   let out = '';
@@ -196,4 +223,48 @@ test('a pending ticket says whether a slot is free for it', async () => {
   paused.paused = true;
   saveSprint(root, paused);
   assert.equal(sprintSummary(root, loadSprint(root, s0.id)).tickets[1].slot, null);
+});
+
+test('a session in a linked worktree lists, takes news for and adopts sprints it made when its own folder name was its key', async () => {
+  const { root, w } = sprintWorld();
+  for (const name of ['fa', 'fr']) scriptAgent(root, name, []);
+  const session = path.join(w.repo, '.claude', 'worktrees', 'old-session');
+  w.git(w.repo, 'worktree', 'add', '-q', '-b', 'session', session);
+  const repoKey = (await cli(root, ['here'], w.repo)).project;
+  assert.equal((await cli(root, ['here'], session)).project, repoKey);
+  const now = await draftSprint(root, { name: 'Now', tickets: [T()] }, { cwd: session, session: 'chat-1' });
+  assert.equal(now.project, repoKey);
+  const older = await draftSprint(root, { name: 'Older', tickets: [T({ key: 'ABC-12' })] }, { cwd: session, session: 'chat-1' });
+  const raw = loadSprint(root, older.id);
+  raw.project = 'old-session';
+  raw.messages.push({ id: '1', at: new Date().toISOString(), text: 'ABC-12 needs you', delivered: false, claimedAt: null });
+  saveSprint(root, raw);
+  // Another repo whose name is the worktree's: its sprint is not this worktree's, though its key is the older one.
+  const other = await draftSprint(root, { name: 'Other', tickets: [T({ key: 'ABC-13' })] }, { cwd: w.repo, session: 'chat-1' });
+  const foreign = loadSprint(root, other.id);
+  Object.assign(foreign, { project: 'old-session', repo: path.join(path.dirname(w.repo), 'old-session') });
+  foreign.messages.push({ id: '1', at: new Date().toISOString(), text: 'ABC-13 needs you', delivered: false, claimedAt: null });
+  saveSprint(root, foreign);
+  const listed = (await cli(root, ['status', '--here'], session)).sprints.map((s) => s.id);
+  assert.deepEqual(listed.sort(), [now.id, older.id].sort());
+  // The main checkout lists only the repo's: the older key named that worktree alone.
+  assert.deepEqual((await cli(root, ['status', '--here'], w.repo)).sprints.map((s) => s.id), [now.id]);
+  assert.deepEqual((await cli(root, ['sprint', 'inbox', '--session', 'chat-1', '--here'], w.repo)).messages, []);
+  assert.deepEqual((await cli(root, ['sprint', 'inbox', '--session', 'chat-1', '--here'], session)).messages.map((m) => m.text), ['ABC-12 needs you']);
+  assert.equal((await cli(root, ['sprint', 'adopt', '--id', other.id, '--session', 'chat-2'], session)).error.code, 'other-repo');
+  await cli(root, ['sprint', 'adopt', '--id', older.id, '--session', 'chat-2'], session);
+  assert.equal(loadSprint(root, older.id).session, 'chat-2');
+});
+
+test("a sprint's steps are filed under the sprint's project, though its folder now has another key", async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ write: 'a.txt' }]);
+  scriptAgent(root, 'fr', [{ say: 'VERDICT: pass' }]);
+  const s0 = await createSprint(root, { name: 'x', tickets: [T()] }, { cwd: w.repo });
+  const raw = loadSprint(root, s0.id);
+  raw.project = 'old-session';
+  saveSprint(root, raw);
+  await tick(root, s0.id, { env: w.env });
+  const step = listJobDirs(root).map(readJob).find((j) => j.sprint?.id === s0.id);
+  assert.equal(step.project, 'old-session');
 });

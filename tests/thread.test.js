@@ -7,6 +7,7 @@ import { saveAdapter } from '../engine/adapters/registry.js';
 import { dispatch } from '../engine/dispatch.js';
 import { readJob, findJobDir, updateJob } from '../engine/store.js';
 import { threadSteps, contextBrief } from '../engine/thread.js';
+import { unfenced } from '../engine/sprint-text.js';
 import { keep } from '../engine/review.js';
 import { tempRoot, tempRepo, fakeAdapter, waitFor } from './helpers.js';
 
@@ -28,6 +29,14 @@ test('contextBrief lists earlier steps, the last summary and the new request', (
   assert.match(brief, /1\. claude: Create calculator\.html/);
   assert.match(brief, /Result of the last step: Built it\./);
   assert.match(brief, /Its changes are already in the files here\. Now:\nAdd CSS$/);
+});
+
+test('a last result cut inside a code block is fenced, so the new request never reads as code', () => {
+  // The end of an output, cut where a block of seven backticks opens and never closes.
+  const cut = 'e\n```diff\n+a.txt\n```\nBroken.\n```````\n\nFinish with one line.';
+  const brief = contextBrief([{ step: 1, agent: 'fa', title: 'Add a.txt' }], cut, 'Fix it.\nTESTS: passed');
+  assert.ok(brief.includes(`Result of the last step: \n\`\`\`\`\`\`\`\`\n${cut}\n\`\`\`\`\`\`\`\``), brief);
+  assert.match(unfenced(brief), /Now:\nFix it\.\nTESTS: passed$/);
 });
 
 test('a follow-up runs in the same copy, sees step 1, and its diff holds both steps', async () => {
@@ -67,6 +76,21 @@ test('follow-ups are refused while busy, when closed, when not latest, or with a
   await assert.rejects(dispatch(root, { agent: 'fake', cwd: repo, prompt: 'x', followUp: readJob(res.dir).id }), (e) => e.code === 'thread-closed');
 });
 
+test('a follow-up of a job filed under an older key for its folder stays in that thread, and step 1 is no longer latest', async () => {
+  const { root, repo, first } = await firstEdit();
+  // As a job started in a linked worktree was filed before worktrees were keyed by their repo: under the worktree's name.
+  const was = findJobDir(root, first.id);
+  const moved = path.join(path.dirname(path.dirname(path.dirname(was))), 'old-worktree', first.ticket, first.id);
+  fs.mkdirSync(path.dirname(moved), { recursive: true });
+  fs.renameSync(was, moved);
+  updateJob(root, moved, { project: 'old-worktree' });
+  const res = await dispatch(root, { agent: 'fake', cwd: repo, prompt: 'Again', followUp: first.id });
+  const second = await finished(res.dir);
+  assert.equal(second.project, 'old-worktree');
+  assert.deepEqual(threadSteps(root, second).map((j) => j.id), [first.id, second.id]);
+  await assert.rejects(dispatch(root, { agent: 'fake', cwd: repo, prompt: 'x', followUp: first.id }), (e) => e.code === 'not-latest');
+});
+
 test('the same agent with a session continues it; the job records resumeFrom instead of a brief', async () => {
   const { root, repo, first } = await firstEdit();
   updateJob(root, findJobDir(root, first.id), { agentSession: { agent: 'fake', id: 'sess-123' } });
@@ -89,6 +113,6 @@ test('a follow-up inherits the ticket and briefs from the last output when there
   const second = readJob(res2.dir);
   assert.equal(second.ticket, 'ABC-9');
   const brief = fs.readFileSync(path.join(res2.dir, 'prompt-brief.md'), 'utf8');
-  assert.match(brief, /Result of the last step: \(its final output\) [\s\S]*edited/);
+  assert.match(brief, /Result of the last step: \n```\n\(its final output\) [\s\S]*edited\n```\n/);
   await finished(res2.dir);
 });

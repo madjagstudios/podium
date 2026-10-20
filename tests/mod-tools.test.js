@@ -52,6 +52,43 @@ test('the sprint tool asks for the ticket it needs', () => {
   assert.deepEqual(engineCall('sprint', { action: 'assign', id: 's1', ticket: 'ABC-11', task: 2, agent: 'codex' }).args, ['sprint', 'assign', '--id', 's1', '--ticket', 'ABC-11', '--task', '2', '--agent', 'codex']);
 });
 
+test('the sprint tool syncs a ticket with its base, and answers about commits Podium didn\'t make', () => {
+  for (const action of ['sync', 'keep-commits', 'drop-commits']) {
+    assert.throws(() => engineCall('sprint', { action, id: 's1' }), { message: 'Say which ticket.' }, action);
+  }
+  assert.deepEqual(engineCall('sprint', { action: 'sync', id: 's1', ticket: 'ABC-11' }).args, ['sprint', 'sync', '--id', 's1', '--ticket', 'ABC-11']);
+  assert.deepEqual(engineCall('sprint', { action: 'keep-commits', id: 's1', ticket: 'ABC-11' }).args, ['sprint', 'commits', '--id', 's1', '--ticket', 'ABC-11', '--answer', 'keep']);
+  assert.deepEqual(engineCall('sprint', { action: 'drop-commits', id: 's1', ticket: 'ABC-11' }).args, ['sprint', 'commits', '--id', 's1', '--ticket', 'ABC-11', '--answer', 'drop']);
+  const sprint = { id: 's1', name: 'Oct', base: 'main', paused: false, finishedAt: null, autoMerge: false, news: 0, tickets: [] };
+  assert.match(formatToolResult('sprint', { ok: true, value: { sprint, commits: 3 } }, { action: 'sync', ticket: 'abc-11' }), /ABC-11 took 3 new commits from main\./);
+  assert.match(formatToolResult('sprint', { ok: true, value: { sprint, dropped: ['abc1234 Fixed by hand'] } }, { action: 'drop-commits', ticket: 'ABC-11' }), /Dropped \(git's reflog keeps them for a while\): abc1234 Fixed by hand\./);
+  const kept = formatToolResult('sprint', { ok: true, value: { sprint, dropped: [] } }, { action: 'keep-commits', ticket: 'ABC-11' });
+  assert.match(kept, /ABC-11 keeps the commits and carries on from them\./);
+  assert.doesNotMatch(kept, /back where Podium left it/);
+  const stashed = formatToolResult('sprint', { ok: true, value: { sprint, commits: 1, saved: "Podium: ABC-11's uncommitted changes before syncing with main" } }, { action: 'sync', ticket: 'ABC-11' });
+  assert.match(stashed, /saved as a git stash \("Podium: ABC-11's uncommitted changes before syncing with main"\): git stash list shows it\./);
+  const said = TOOLS.find((t) => t.name === 'sprint').description;
+  assert.match(said, /Never commit in a ticket's copy yourself/);
+});
+
+test('the sprint tool\'s note goes by stdin, as does a retry\'s, and its reply says who reads it', () => {
+  assert.throws(() => engineCall('sprint', { action: 'note', id: 's1', text: 'x' }), { message: 'Say which ticket.' });
+  assert.throws(() => engineCall('sprint', { action: 'note', id: 's1', ticket: 'ABC-11', text: '  ' }), { message: 'Say what the note is (text).' });
+  assert.deepEqual(engineCall('sprint', { action: 'note', id: 's1', ticket: 'ABC-11', text: ' Leave the date tests.\n' }),
+    { args: ['sprint', 'note', '--id', 's1', '--ticket', 'ABC-11', '--text', '-'], stdin: 'Leave the date tests.' });
+  assert.deepEqual(engineCall('sprint', { action: 'retry', id: 's1', ticket: 'ABC-11', agent: 'codex', text: 'Leave the date tests.' }),
+    { args: ['sprint', 'retry', '--id', 's1', '--ticket', 'ABC-11', '--agent', 'codex', '--note', '-'], stdin: 'Leave the date tests.' });
+  assert.deepEqual(engineCall('sprint', { action: 'retry', id: 's1', ticket: 'ABC-11', text: ' ' }), { args: ['sprint', 'retry', '--id', 's1', '--ticket', 'ABC-11'] });
+  const sprint = { id: 's1', name: 'Oct', base: 'main', paused: false, finishedAt: null, autoMerge: false, news: 0, tickets: [] };
+  assert.match(formatToolResult('sprint', { ok: true, value: { sprint, noted: { key: 'ABC-11', n: 1, running: false } } }, { action: 'note' }),
+    /\n\nNoted on ABC-11\. Every later planner, writer and reviewer of ABC-11 reads it\.$/);
+  assert.match(formatToolResult('sprint', { ok: true, value: { sprint, noted: { key: 'ABC-11', n: 2, running: true } } }, { action: 'note' }),
+    /Noted on ABC-11\. The step running now won't see it; every later step of ABC-11 will\.$/);
+  const said = TOOLS.find((t) => t.name === 'sprint');
+  assert.ok(said.inputSchema.properties.action.enum.includes('note'));
+  assert.match(said.description, /never add a note on your own/);
+});
+
 test('dispatch passes a starting branch', () => {
   const call = engineCall('dispatch', { agent: 'codex', task: 'Review', base: 'feat/oc-11-chapter-3' });
   const i = call.args.indexOf('--base');
@@ -63,6 +100,14 @@ test('dispatch can continue a job', () => {
   const call = engineCall('dispatch', { agent: 'codex', task: 'Fix it', followUp: 'job-1' });
   assert.equal(call.args[call.args.indexOf('--follow-up') + 1], 'job-1');
   assert.ok(TOOLS.find((t) => t.name === 'dispatch').inputSchema.properties.followUp);
+});
+
+test('dispatch says a PR review and a follow-up do not go together', () => {
+  const props = TOOLS.find((t) => t.name === 'dispatch').inputSchema.properties;
+  assert.match(props.followUp.description, /pr/);
+  assert.match(props.followUp.description, /can'?t be continued/);
+  assert.match(props.pr.description, /followUp/);
+  assert.match(props.pr.description, /can'?t be continued/);
 });
 
 test('the pr tool maps actions; dispatch can review a PR', () => {
@@ -116,6 +161,25 @@ test('the sprint draft carries the repo\'s commands and check, and the reply say
   assert.match(sprintTool.description, /take effect for this repo only when the user presses Start/);
 });
 
+test('the sprint draft carries the repo\'s plans folder, passed through for the engine to refuse plainly', () => {
+  const call = engineCall('sprint', { action: 'draft', name: 'Oct', tickets: [], planDir: 'docs/custom/plans' });
+  assert.deepEqual(JSON.parse(call.stdin), { name: 'Oct', tickets: [], planDir: 'docs/custom/plans' });
+  assert.ok(TOOLS.find((t) => t.name === 'sprint').inputSchema.properties.planDir);
+  const bad = engineCall('sprint', { action: 'draft', name: 'Oct', tickets: [], planDir: 42 });
+  assert.deepEqual(JSON.parse(bad.stdin).planDir, 42);
+});
+
+test('the sprint draft carries whether the repo\'s PRs keep their plan, passed through for the engine to refuse plainly', () => {
+  const call = engineCall('sprint', { action: 'draft', name: 'Oct', tickets: [], keepPlan: true });
+  assert.deepEqual(JSON.parse(call.stdin), { name: 'Oct', tickets: [], keepPlan: true });
+  const sprintTool = TOOLS.find((t) => t.name === 'sprint');
+  assert.equal(sprintTool.inputSchema.properties.keepPlan.type, 'boolean');
+  assert.match(sprintTool.description, /planDir and keepPlan/);
+  const bad = engineCall('sprint', { action: 'draft', name: 'Oct', tickets: [], keepPlan: 'yes' });
+  assert.equal(JSON.parse(bad.stdin).keepPlan, 'yes');
+  assert.equal('keepPlan' in JSON.parse(engineCall('sprint', { action: 'draft', name: 'Oct', tickets: [] }).stdin), false);
+});
+
 test('status by id shows a sprint step and which sprint it belongs to; the full list still leaves it out', () => {
   const at = '2026-10-06T10:00:00Z';
   const step = { id: 'j2', agent: 'codex', title: 'ABC-11 task 2: A', status: 'running', createdAt: at, endedAt: null, sprint: { id: 's1', ticket: 'ABC-11', task: 2, role: 'author' } };
@@ -150,4 +214,32 @@ test('sprint action adopt takes a sprint into this chat by id', () => {
   assert.match(sprint.description, /"adopt" \(id\)/);
   assert.deepEqual(engineCall('sprint', { action: 'adopt', id: 's1' }).args, ['sprint', 'adopt', '--id', 's1', '--here']);
   assert.throws(() => engineCall('sprint', { action: 'adopt' }), { message: /Say which sprint/ });
+});
+
+test('the sprint tool accepts a ticket\'s test results with the user\'s reason, by stdin', () => {
+  assert.throws(() => engineCall('sprint', { action: 'accept', id: 's1', text: 'x' }), { message: 'Say which ticket.' });
+  assert.throws(() => engineCall('sprint', { action: 'accept', id: 's1', ticket: 'ABC-11' }), { message: 'Say why the test results are fine (text).' });
+  assert.deepEqual(engineCall('sprint', { action: 'accept', id: 's1', ticket: 'ABC-11', text: ' Fails on main too. ' }),
+    { args: ['sprint', 'accept', '--id', 's1', '--ticket', 'ABC-11', '--text', '-'], stdin: 'Fails on main too.' });
+  const tool = TOOLS.find((t) => t.name === 'sprint');
+  assert.ok(tool.inputSchema.properties.action.enum.includes('accept'));
+  assert.match(tool.description, /"accept" \(id, ticket, text: why the results are fine/);
+});
+
+test('the sprint tool sends a failed review back with the user\'s evidence, by stdin', () => {
+  assert.throws(() => engineCall('sprint', { action: 'evidence', id: 's1', ticket: 'ABC-11' }), { message: 'Say what the reviewer should weigh (text).' });
+  assert.deepEqual(engineCall('sprint', { action: 'evidence', id: 's1', ticket: 'ABC-11', text: ' CI passed. ' }),
+    { args: ['sprint', 'evidence', '--id', 's1', '--ticket', 'ABC-11', '--text', '-'], stdin: 'CI passed.' });
+  const tool = TOOLS.find((t) => t.name === 'sprint');
+  assert.ok(tool.inputSchema.properties.action.enum.includes('evidence'));
+  assert.match(tool.description, /"evidence" \(id, ticket, text: what the reviewer should weigh/);
+});
+
+test('approve and one-task pass acknowledge only when it is true', () => {
+  assert.deepEqual(engineCall('sprint', { action: 'approve', id: 's1', ticket: 'ABC-1' }).args, ['sprint', 'approve', '--id', 's1', '--ticket', 'ABC-1']);
+  assert.deepEqual(engineCall('sprint', { action: 'approve', id: 's1', ticket: 'ABC-1', acknowledge: true }).args, ['sprint', 'approve', '--id', 's1', '--ticket', 'ABC-1', '--acknowledge']);
+  assert.deepEqual(engineCall('sprint', { action: 'one-task', id: 's1', ticket: 'ABC-1', acknowledge: 'yes' }).args, ['sprint', 'one-task', '--id', 's1', '--ticket', 'ABC-1']);
+  const sprint = TOOLS.find((x) => x.name === 'sprint');
+  assert.equal(sprint.inputSchema.properties.acknowledge.type, 'boolean');
+  assert.match(sprint.description, /needs your attention runs production commands/);
 });

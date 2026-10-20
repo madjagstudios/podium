@@ -64,7 +64,7 @@ export function runInGroup(file, args, options, { timeoutMs, platform = process.
     };
     const stop = (err) => {
       if (done) return;
-      killGroup(child.pid, { platform, ...(kill ? { kill } : {}) });
+      killGroup(child.pid, { platform, ...(kill ? { kill } : {}), refused: () => child.kill() });
       child.stdout?.destroy();
       child.stderr?.destroy();
       settle(Object.assign(err, { killed: true, signal: 'SIGKILL', code: err.code ?? null }));
@@ -115,7 +115,10 @@ export async function gitIn(cwd, args, opts) {
   try {
     return (await git(cwd, args, opts)).stdout.trim();
   } catch (e) {
-    throw new PodiumError('git-failed', `git ${args[0]}: ${gitReason(e)}`);
+    throw new PodiumError('git-failed', `git ${args[0]}: ${gitReason(e)}`, {
+      stderr: String(e.stderr ?? '').slice(0, 16 * 1024),
+      stdout: String(e.stdout ?? '').slice(0, 16 * 1024),
+    });
   }
 }
 
@@ -264,6 +267,12 @@ async function baseRemote(repo, base) {
   const remotes = (await gitIn(repo, ['remote'])).split(/\r?\n/).filter(Boolean);
   if (upstream && remotes.includes(upstream)) return upstream;
   return remotes.includes('origin') ? 'origin' : null;
+}
+
+// The base as it was last fetched, without fetching: its remote-tracking ref, or with no remote the local base.
+export async function baseRef(repo, base) {
+  const remote = await baseRemote(repo, base);
+  return remote ? `refs/remotes/${remote}/${base}` : `refs/heads/${base}`;
 }
 
 // The base as the remote has it now ("after"): fetch it into its remote-tracking ref and return that

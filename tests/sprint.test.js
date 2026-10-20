@@ -34,9 +34,10 @@ test('createSprint reads each plan into tasks with their agents and saves the sp
       { n: 1, title: 'Add a.txt', agent: 'fa', reviewer: 'fr', status: 'to-do', canAssign: true },
       { n: 2, title: 'Add b.txt', agent: 'fb', reviewer: 'fr', status: 'to-do', canAssign: true },
     ],
-    canRetry: false, giveTo: null, canStop: true,
+    canRetry: false, giveTo: null, foreignCommits: null, canSync: false, canStop: true,
     plan: 'docs/plan.md', writer: null, reviewer: null, canAssignPlan: false, after: [], waitingOn: [], slot: 'free',
-    proposed: null, canApprove: false, canOneTask: false, canRevise: false,
+    proposed: null, attention: null, attentionMore: 0, canApprove: false, canOneTask: false, canRevise: false,
+    notes: [], noteCount: 0, canNote: true, canAccept: false, canEvidence: false, testsWhere: null, agentLeft: false,
   });
 });
 

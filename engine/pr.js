@@ -88,7 +88,7 @@ async function freeBranch(wt, wanted) {
 // body: a sprint ticket's own PR body; without it the body is the work's summary and steps. forcePush: null pushes
 // as usual; a string replaces the remote branch only if it is still at that commit ("" = it must not exist yet), through
 // --force-with-lease=<branch>:<commit>, so a branch Podium did not push is refused (a sprint ticket's squashed branch).
-export async function openPr(root, id, { env = process.env, watch = false, title = null, fromSprint = false, body = null, forcePush = null, autoMerge = false } = {}) {
+export async function openPr(root, id, { env = process.env, watch = false, title = null, fromSprint = false, body = null, forcePush = null, autoMerge = false, ciChecks = [] } = {}) {
   // One Open PR at a time per piece of work: a second press while it runs is refused.
   const lock = path.join(findJobDir(root, id), 'pr-open.lock');
   try {
@@ -100,13 +100,13 @@ export async function openPr(root, id, { env = process.env, watch = false, title
     fs.writeFileSync(lock, String(process.pid));
   }
   try {
-    return await openPrOnce(root, id, { env, watch, title, fromSprint, body, forcePush, autoMerge });
+    return await openPrOnce(root, id, { env, watch, title, fromSprint, body, forcePush, autoMerge, ciChecks });
   } finally {
     fs.rmSync(lock, { force: true });
   }
 }
 
-async function openPrOnce(root, id, { env, watch, title, fromSprint, body, forcePush, autoMerge }) {
+async function openPrOnce(root, id, { env, watch, title, fromSprint, body, forcePush, autoMerge, ciChecks }) {
   const job = readJob(findJobDir(root, id));
   const { steps, latest } = threadOf(root, job);
   if (latest.sprint && !fromSprint) throw sprintJobError();
@@ -150,6 +150,8 @@ async function openPrOnce(root, id, { env, watch, title, fromSprint, body, force
     checks: { total: 0, passed: 0, failed: 0, running: 0, failing: [], failedRunId: null },
     review: null, mergeable: 'UNKNOWN', comments: 0, autoMerge: Boolean(autoMerge), blocked: null, attention: null,
     openedAt: now.toISOString(), checkedAt: null, watchUntil: new Date(now.getTime() + WATCH_DAYS * 86_400_000).toISOString(),
+    // What its plan left to its CI: followed by refreshPr (ciVerdict), and auto-merge waits for it to pass.
+    ...(ciChecks?.length ? { ciChecks: [...ciChecks] } : {}),
   };
   // A sprint ticket's step stays delivered (see finishPr). Other work's grace for its own chat counts from now
   // (notifiedAt), not from when its step ended.
@@ -163,8 +165,10 @@ async function openPrOnce(root, id, { env, watch, title, fromSprint, body, force
 
 const PASSED = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED']);
 
+// skipped: passed checks that did not run (skipped or neutral); cancelled: failed ones that were cancelled, as a run a
+// newer push replaced is. Only a PR whose plan left checks to its CI reads them (ciVerdict).
 export function checksOf(rollup = []) {
-  const c = { total: 0, passed: 0, failed: 0, running: 0, failing: [], failedRunId: null };
+  const c = { total: 0, passed: 0, failed: 0, running: 0, failing: [], failedRunId: null, skipped: 0, cancelled: 0 };
   for (const item of rollup) {
     c.total++;
     const name = item.name ?? item.context ?? 'check';
@@ -172,8 +176,11 @@ export function checksOf(rollup = []) {
     const done = isStatus ? !['PENDING', 'EXPECTED'].includes(item.state) : item.status === 'COMPLETED';
     const ok = isStatus ? item.state === 'SUCCESS' : PASSED.has(item.conclusion);
     if (!done) c.running++;
-    else if (ok) c.passed++;
-    else {
+    else if (ok) {
+      c.passed++;
+      if (!isStatus && (item.conclusion === 'SKIPPED' || item.conclusion === 'NEUTRAL')) c.skipped++;
+    } else {
+      if (!isStatus && item.conclusion === 'CANCELLED') c.cancelled++;
       c.failed++;
       c.failing.push(name);
       c.failedRunId ??= String(item.detailsUrl ?? '').match(/\/runs\/(\d+)/)?.[1] ?? null;
@@ -190,10 +197,37 @@ export function attentionOf(pr) {
   return null;
 }
 
-// Safe to merge: every check passed, GitHub says mergeable, no one asked for changes.
+// A PR whose plan left checks to its CI (pr.ciChecks): how that CI stands. 'failed' once a check failed other than by
+// being cancelled, else 'waiting' while any runs or was cancelled (a newer push's run follows), else 'passed' once a check
+// passed by running, and 'none' when every check was skipped. With none reported, 'none' once CI_NONE_MS has passed since
+// the PR opened (the repo may run no CI on PRs), else 'waiting'. null for a PR without such checks.
+export const CI_NONE_MS = 30 * 60_000;
+export function ciVerdict(pr, now = Date.now()) {
+  if (!pr?.ciChecks?.length) return null;
+  const c = pr.checks ?? {};
+  if (c.failed > (c.cancelled ?? 0)) return 'failed';
+  if (c.running > 0 || (c.cancelled ?? 0) > 0) return 'waiting';
+  if (c.total > 0) return c.passed > (c.skipped ?? 0) ? 'passed' : 'none';
+  return now - (Date.parse(pr.openedAt ?? '') || now) > CI_NONE_MS ? 'none' : 'waiting';
+}
+
+// What a sprint is told when such a PR's CI settles.
+export function ciNews(pr, verdict) {
+  const what = `${pr.title} (PR #${pr.number})`;
+  const list = (pr.ciChecks ?? []).join('; ');
+  if (verdict === 'passed') return `${what}: CI passed, so the checks the plan left to it passed: ${list}.`;
+  if (verdict === 'failed') return `${what}: CI failed (${(pr.checks?.failing ?? []).join(', ') || 'a check'}), so the checks the plan left to it did not pass: ${list}. Fix it on the PR's branch before it merges.`;
+  return (pr.checks?.total ?? 0) > 0
+    ? `${what}: every CI check was skipped, so nothing checked what the plan left to CI: ${list}. Check these by hand before it merges.`
+    : `${what}: no CI check reported in ${CI_NONE_MS / 60_000} minutes, so nothing checked what the plan left to CI: ${list}. Check these by hand before it merges.`;
+}
+
+// Safe to merge: every check passed, GitHub says mergeable, no one asked for changes; and a PR whose plan left checks to
+// its CI only once that CI has passed (never before any check has reported).
 export function mergeDecision(pr) {
   return pr.state === 'OPEN' && pr.checks.failed === 0 && pr.checks.running === 0
-    && pr.mergeable === 'MERGEABLE' && pr.review !== 'CHANGES_REQUESTED' && !pr.blocked;
+    && pr.mergeable === 'MERGEABLE' && pr.review !== 'CHANGES_REQUESTED' && !pr.blocked
+    && (!pr.ciChecks?.length || ciVerdict(pr) === 'passed');
 }
 
 function latestOf(root, id) {
@@ -411,25 +445,55 @@ export async function refreshPr(root, id, { env = process.env } = {}) {
   };
   pr.attention = attentionOf(pr);
   if (pr.state === 'MERGED' || pr.state === 'CLOSED') return finishPr(root, latest, pr);
-  // Under the thread's lock, so a late OPEN answer can't land in the middle of a merge being recorded.
+  // Under the thread's lock, so a late OPEN answer can't land in the middle of a merge being recorded. The checks its plan
+  // left to CI: each new settled result counts once (ciRound, ciSaid), and counts again after the CI runs again.
   const { state, mergeable, review, checks, comments, checkedAt, mergeCommit } = pr;
-  return lockedThread(root, latest, (now) => {
+  const fresh = await lockedThread(root, latest, (now) => {
     const next = { ...now.pr, state, mergeable, review, checks, comments, checkedAt, mergeCommit: mergeCommit ?? now.pr.mergeCommit ?? null };
     next.attention = attentionOf(next);
+    const verdict = ciVerdict(next);
+    if (verdict === 'waiting' && next.ciSaid) next.ciSaid = null;
+    else if (verdict && verdict !== 'waiting' && verdict !== next.ciSaid) Object.assign(next, { ciSaid: verdict, ciRound: (next.ciRound ?? 0) + 1 });
     return { pr: next };
   });
+  // A sprint step's CI result goes to its sprint's messages, once per round (the key stops a second refresher saying it
+  // again). News the sprint can't take now waits in the step's outbox, as a merge's does. A round counts as told
+  // (ciTold) only once the sprint or the outbox has it, so one cut short by a crash or a failed write is told next time.
+  const round = fresh.pr?.ciRound ?? 0;
+  if (!fresh.sprint || round <= (fresh.pr.ciTold ?? 0) || !fresh.pr.ciSaid) return fresh;
+  const news = { key: `pr:${fresh.pr.number}:ci:${round}`, text: ciNews(fresh.pr, fresh.pr.ciSaid) };
+  const dir = findJobDir(root, fresh.id);
+  let kept = await tellSprint(root, fresh.sprint.id, news.text, { dir, key: news.key });
+  if (!kept) {
+    kept = await finishLocked(root, fresh, async () => {
+      const now = readJob(dir);
+      updateJob(root, dir, outbox([...sprintNewsOf(now).filter((n) => n.key !== news.key), news]), 'sprint-news');
+    }).then(() => true, () => false);
+  }
+  if (!kept) return readJob(dir);
+  return lockedThread(root, readJob(dir), (now) => ({ pr: { ...now.pr, ciTold: Math.max(now.pr.ciTold ?? 0, round) } })).catch(() => readJob(dir));
 }
 
 const METHOD_ORDER = ['squash', 'merge', 'rebase'];
 const ALLOWED_FIELD = { squash: 'squashMergeAllowed', merge: 'mergeCommitAllowed', rebase: 'rebaseMergeAllowed' };
 
-// How a PR merges: the repo's own method in Podium (repoMergeMethod), else the repo's default on GitHub, else
-// Podium's mergeMethod. One the repo does not allow gives way to the first it does, in the order squash, merge, rebase.
-export function pickMethod(settings, job) {
+// The merge methods GitHub allows for a repo, in the order Podium prefers them.
+export function allowedMethods(methods) {
+  return methods ? METHOD_ORDER.filter((m) => methods[ALLOWED_FIELD[m]] === true) : [];
+}
+
+// The merge method Podium is set to use: the repo's own method in Podium, else the repo's default on GitHub,
+// else Podium's mergeMethod.
+export function wantedMethod(settings, job) {
   const methods = job.pr?.methods ?? null;
   const fromRepo = String(methods?.viewerDefaultMergeMethod ?? '').toLowerCase();
-  const wanted = repoSettings(settings, job.project).mergeMethod ?? (METHOD_ORDER.includes(fromRepo) ? fromRepo : settings.mergeMethod);
-  const allowed = methods ? METHOD_ORDER.filter((m) => methods[ALLOWED_FIELD[m]] === true) : [];
+  return repoSettings(settings, job.project).mergeMethod ?? (METHOD_ORDER.includes(fromRepo) ? fromRepo : settings.mergeMethod);
+}
+
+// How a PR merges: the wanted method, unless the repo does not allow it, in which case the first it does.
+export function pickMethod(settings, job) {
+  const wanted = wantedMethod(settings, job);
+  const allowed = allowedMethods(job.pr?.methods ?? null);
   return !allowed.length || allowed.includes(wanted) ? wanted : allowed[0];
 }
 

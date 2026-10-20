@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runCaptured } from './launch.js';
 import { loadSettings } from './settings.js';
+import { worktreeDir } from './paths.js';
 import { readJson, writeJsonAtomic } from './fsutil.js';
 
 export const PLUGIN_ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -42,11 +43,14 @@ export async function doctor(root) {
   const gitVersion = await versionOf('git', ['--version']);
   const ghVersion = await versionOf('gh', ['--version']);
   const signedIn = ghVersion ? (await runCaptured('gh', ['auth', 'status'], { timeoutMs: 10_000 })).code === 0 : false;
+  const settings = loadSettings(root);
+  const copiesRoot = worktreeDir(root, settings);
   return {
     node: { ok: atLeast(nodeVersion, '22'), version: nodeVersion },
     git: { ok: gitVersion ? atLeast(gitVersion, '2.28') : false, version: gitVersion },
     gh: { installed: Boolean(ghVersion), signedIn, version: ghVersion },
-    tellClaude: loadSettings(root).tellClaudeWhenDone !== false,
+    tellClaude: settings.tellClaudeWhenDone !== false,
+    copies: { root: copiesRoot, ok: !/[\s%]/.test(copiesRoot) },
     welcomed: fs.existsSync(path.join(root, 'welcome.json')),
   };
 }

@@ -1,7 +1,7 @@
 // Who delivers a finished job's message, and only once. The session that
-// dispatched the job goes first; any session may after ORIGIN_GRACE_MS. A
-// delivery.lock file (created exclusively) stops two sessions delivering at once;
-// a lock older than LOCK_STALE_MS belonged to a session that died or reloaded.
+// dispatched the job goes first, at any age; any session may after ORIGIN_GRACE_MS,
+// until OTHER_CHATS_MS. A delivery.lock file (created exclusively) stops two sessions
+// delivering at once; a lock older than LOCK_STALE_MS belonged to a session that died or reloaded.
 import fs from 'node:fs';
 import path from 'node:path';
 import { findJobDir, readJob } from './store.js';
@@ -11,6 +11,7 @@ import { sprintNewsOf } from './pr.js';
 
 const DELIVERABLE = new Set(['done', 'needs-review', 'failed', 'lost', 'in-review', 'merged', 'closed']);
 export const ORIGIN_GRACE_MS = 120_000;
+export const OTHER_CHATS_MS = 3_600_000;
 export const LOCK_STALE_MS = 60_000;
 export const LOCK_FILE = 'delivery.lock';
 
@@ -46,7 +47,12 @@ export function claimDelivery(root, id, session, { now = Date.now() } = {}) {
     // A sprint that can't be read just now (busy, damaged) may have moved to another chat: nobody takes it until it reads.
     if (owner === UNKNOWN) return { claimed: false, reason: 'not-yours-yet' };
     if (owner && owner !== session) return { claimed: false, reason: 'not-yours-yet' };
-  } else if (origin && origin !== session && now - since <= ORIGIN_GRACE_MS) return { claimed: false, reason: 'not-yours-yet' };
+  } else if (origin !== session) {
+    if (origin && now - since <= ORIGIN_GRACE_MS) return { claimed: false, reason: 'not-yours-yet' };
+    // Older news is about work this chat knows nothing of, and a backlog of it would cost a turn each. It stays listed
+    // in the pane and undelivered, so its own chat still gets it whenever it looks.
+    if (now - since > OTHER_CHATS_MS) return { claimed: false, reason: 'too-old' };
+  }
   return takeLock(path.join(dir, LOCK_FILE), session, now) ? { claimed: true } : { claimed: false, reason: 'claimed-elsewhere' };
 }
 

@@ -8,7 +8,7 @@ import { dispatch } from '../engine/dispatch.js';
 import { createSprint, loadSprint, saveSprint, tick } from '../engine/sprint.js';
 import { tempRoot, sprintWorld, scriptAgent } from './helpers.js';
 
-const SAYS = 'This is part of a sprint. Use the sprint tool to pause, retry or reassign it.';
+const SAYS = 'This is part of a sprint. Use the sprint tool to pause, retry or reassign it; to tell its ticket\'s agents something, use its "note" action (id, ticket, text).';
 const refused = (e) => e.code === 'sprint-job' && e.message === SAYS;
 
 function sprintJob(patch = {}) {
@@ -50,7 +50,7 @@ test('a ticket whose PR is already open adopts it instead of opening another', a
   assert.equal(w.calls().length, 0, 'gh was not asked to open a PR');
 });
 
-test('a follow-up of a sprint step is refused unless it carries sprint meta', async () => {
+test('a follow-up of a sprint step is refused unless it carries sprint meta, and the refusal names the note action', async () => {
   const { root, id } = sprintJob();
   await assert.rejects(dispatch(root, { agent: 'fa', cwd: tempRoot(), prompt: 'more', followUp: id }), refused);
   await assert.rejects(

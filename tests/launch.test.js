@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { assertArg, commandLine, resolveCommand, runCaptured, spawnDetachedNode, killTree, killGroup, safeArgText } from '../engine/launch.js';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { spawn } from 'node:child_process';
 import { FAKE_AGENT, tempRoot, waitFor } from './helpers.js';
 
 test('assertArg rejects shell metacharacters and empty strings', () => {
@@ -85,6 +86,46 @@ test('killGroup kills the whole process group on macOS and Linux, and falls back
   assert.deepEqual(calls, [[-123, 'SIGKILL'], [123, 'SIGKILL']]);
 });
 
+test('on Windows killTree waits for taskkill: a tree already gone is done, a refused stop falls back to the process alone', async () => {
+  const answer = (r) => () => r;
+  const calls = [];
+  const refused = (pid, said) => calls.push([pid, said]);
+  assert.equal(killTree(123, 'win32', { run: answer({ status: 0 }), refused }), true);
+  assert.equal(killTree(123, 'win32', { run: answer({ status: 128, stderr: 'ERROR: The process "123" not found.' }), refused }), true);
+  assert.deepEqual(calls, []);
+  assert.equal(killTree(123, 'win32', { run: answer({ status: 1, stderr: 'ERROR: Access denied\r\n' }), refused }), false);
+  assert.equal(killTree(124, 'win32', { run: answer({ status: null, error: new Error('spawnSync taskkill EPERM') }), refused }), false);
+  assert.deepEqual(calls, [[123, 'ERROR: Access denied'], [124, 'spawnSync taskkill EPERM']]);
+  // By default the refused stop ends the process itself.
+  const pid = spawnDetachedNode(FAKE_AGENT, ['--mode', 'slow', '--prompt-file', FAKE_AGENT]);
+  const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  try {
+    assert.equal(killTree(pid, 'win32', { run: answer({ status: 1, stderr: 'ERROR: Access denied' }) }), false);
+    await waitFor(() => !alive(), { timeoutMs: 10_000 });
+  } finally {
+    try { process.kill(pid); } catch { /* gone */ }
+  }
+});
+
+test('runCaptured past its time limit lets go of its output: a helper left running (its tree stop refused) never keeps the caller alive', async () => {
+  const pidFile = path.join(tempRoot(), 'pid');
+  const launch = pathToFileURL(fileURLToPath(new URL('../engine/launch.js', import.meta.url))).href;
+  const holder = fileURLToPath(new URL('./pipe-holder.js', import.meta.url));
+  // The caller: its command's tree stop is refused, so only the command itself is stopped and its helper keeps the pipes.
+  const code = `import { runCaptured } from ${JSON.stringify(launch)};
+const r = await runCaptured(process.execPath, [${JSON.stringify(holder)}, ${JSON.stringify(pidFile)}], { timeoutMs: 1500, stopTree: (pid, { refused }) => refused() });
+console.log(r.timedOut ? 'timed out' : 'ended');`;
+  const caller = spawn(process.execPath, ['--input-type=module', '-e', code], { stdio: ['ignore', 'pipe', 'inherit'] });
+  let out = '';
+  caller.stdout.on('data', (d) => { out += d; });
+  const exited = new Promise((r) => caller.on('exit', r));
+  const helper = Number(await waitFor(() => fs.existsSync(pidFile) && fs.readFileSync(pidFile, 'utf8').trim(), { timeoutMs: 10_000 }));
+  const alive = () => { try { process.kill(helper, 0); return true; } catch { return false; } };
+  await exited;
+  assert.equal(out.trim(), 'timed out');
+  assert.equal(alive(), true, 'the caller ended while the helper still held its output');
+});
+
 test('runCaptured past its time limit stops the helpers the command started too', async () => {
   const pidFile = path.join(tempRoot(), 'pid');
   const r = await runCaptured(process.execPath, [fileURLToPath(new URL('./sleeper.js', import.meta.url)), pidFile], { input: '', timeoutMs: 1500 });
@@ -92,7 +133,9 @@ test('runCaptured past its time limit stops the helpers the command started too'
   const pid = Number(await waitFor(() => fs.existsSync(pidFile) && fs.readFileSync(pidFile, 'utf8').trim(), { timeoutMs: 5000 }));
   const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
   try {
-    await waitFor(() => !alive(), { timeoutMs: 10_000 });
+    await waitFor(() => !alive(), { timeoutMs: 10_000 }).catch(() => {
+      throw new Error(`The command's helper (pid ${pid}) is still running: its tree stop was refused (in a sandbox that denies taskkill, run this test outside it). The test stops it by pid now.`);
+    });
   } finally {
     try { process.kill(pid); } catch { /* gone */ }
   }

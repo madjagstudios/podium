@@ -43,6 +43,15 @@ test('doctor reports node, git, settings and the welcome record', async () => {
   assert.equal(again.welcomed, true);
 });
 
+test('doctor flags a copies folder whose path has a space', async () => {
+  const root = tempRoot();
+  const spaced = path.join(root, 'my copies');
+  setSetting(root, 'worktreeRoot', spaced);
+  const report = await doctor(root);
+  assert.equal(report.copies.root, spaced);
+  assert.equal(report.copies.ok, false);
+});
+
 test('versionInfo notices a new version once one has been seen before', () => {
   const root = tempRoot();
   const v1 = fakePlugin('0.1.0');

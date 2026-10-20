@@ -734,6 +734,20 @@ test('slimSprints sends a waiting plan\'s first 30 task titles, cut short, and h
   assert.deepEqual([card.after, card.waitingOn], [[], []]);
 });
 
+test('slimSprints sends a ticket\'s notes only with the open ticket\'s row; its count and Add a note ride on every row and card', async () => {
+  const { slimSprints, sprintCard } = await import('../mod/client.js');
+  const notes = [{ n: 1, at: '2026-10-14T15:00:00.000Z', text: 'Leave the date tests.' }];
+  const row = (key) => ({ key, title: key, state: 'parked', task: 1, of: 1, phase: null, agent: 'codex', reason: null, findings: null, pr: null, reviews: 0, latest: 'j1', tasks: [], notes, noteCount: 1, canNote: true });
+  const s = { id: 's1', name: 'Oct', draft: false, discarded: false, paused: false, finishedAt: null, autoMerge: false, maxParallel: 3, news: 0, tickets: [row('ABC-14'), row('ABC-15')] };
+  const [open] = slimSprints([s], { sprint: 's1', open: 'ABC-14' });
+  assert.deepEqual(open.tickets.map((t) => t.notes), [notes, undefined]);
+  assert.deepEqual(open.tickets.map((t) => [t.noteCount, t.canNote]), [[1, true], [1, true]]);
+  const [closed] = slimSprints([s]);
+  assert.ok(closed.tickets.every((t) => t.notes === undefined));
+  const card = sprintCard(open).tickets[0];
+  assert.deepEqual([card.notes, card.canNote], [undefined, true]);
+});
+
 test('a sprint with a plan waiting comes before quieter ones, and its row is kept on a capped card', async () => {
   const { sprintOrder, capRows } = await import('../mod/client.js');
   const t = (key, state) => ({ key, title: key, state, task: 1, of: 1, phase: null, agent: 'codex', reason: null, pr: null, reviews: 0 });
@@ -1018,4 +1032,89 @@ test('with many finished sprints and a full model, fitModel stays under the budg
     assert.ok(kept('chat-1') <= 5 && kept('chat-2') <= 5, `at most five a fold at ${budget}`);
     if (tight.olderSprints) assert.equal(tight.olderSprints.mine + kept('chat-1') + tight.olderSprints.others + kept('chat-2') + (tight.hiddenSprints ?? 0), 80, `every finished sprint shown or counted at ${budget}`);
   }
+});
+
+
+test('a plan\'s production commands go whole to the open row, as a count to the other rows, cards and Your turn', () => {
+  const attention = [{ n: 1, command: 'git push' }, { n: 2, command: 'npm publish' }];
+  const list = [{ id: 's1', name: 'Oct', tickets: [{ key: 'A-1', title: 'a', state: 'plan-ready', attention }, { key: 'A-2', title: 'b', state: 'plan-ready', attention }, { key: 'A-3', title: 'c', state: 'running', attention: null }] }];
+  const [s] = slimSprints(list, { sprint: 's1', open: 'A-1' });
+  assert.deepEqual(s.tickets[0].attention, attention);
+  assert.equal(s.tickets[0].attentionCount, undefined);
+  assert.deepEqual([s.tickets[1].attention, s.tickets[1].attentionCount], [undefined, 2]);
+  assert.deepEqual([s.tickets[2].attention, s.tickets[2].attentionCount], [undefined, undefined]);
+  const card = sprintCard(s);
+  assert.deepEqual(card.tickets.map((t) => t.attentionCount), [2, 2, undefined]);
+  assert.ok(card.tickets.every((t) => t.attention === undefined));
+  assert.deepEqual(turnTickets(list).tickets.map((t) => t.attentionCount), [2, 2]);
+});
+
+test('a plan\'s production commands past the listed ones go with the open row, and count on every other form', () => {
+  const attention = [{ n: 1, command: 'git push' }];
+  const list = [{ id: 's1', name: 'Oct', tickets: [{ key: 'A-1', title: 'a', state: 'plan-ready', attention, attentionMore: 3 }, { key: 'A-2', title: 'b', state: 'plan-ready', attention, attentionMore: 3 }] }];
+  const [s] = slimSprints(list, { sprint: 's1', open: 'A-1' });
+  assert.deepEqual([s.tickets[0].attention, s.tickets[0].attentionMore, s.tickets[0].attentionCount], [attention, 3, undefined]);
+  assert.deepEqual([s.tickets[1].attention, s.tickets[1].attentionCount], [undefined, 4]);
+  assert.deepEqual(sprintCard(s).tickets.map((t) => t.attentionCount), [4, 4]);
+  assert.deepEqual(turnTickets(list).tickets.map((t) => t.attentionCount), [4, 4]);
+});
+
+test('a sprint card sends a ticket\'s CI state as one flat prop, only when it has one', () => {
+  const ticket = (over = {}) => ({ key: 'A-1', title: 'x', state: 'pr-open', task: 1, of: 1, phase: null, agent: 'codex', reason: null, pr: { number: 3 }, reviews: 1, latest: 'j1', canRetry: false, giveTo: null, canStop: false, after: [], waitingOn: [], ...over });
+  const card = (t) => sprintCard({ id: 's1', name: 'S', tickets: [t] }).tickets[0];
+  assert.equal(card(ticket({ ci: { state: 'passed', checks: ['CI green'], failing: [] } })).ciState, 'passed');
+  assert.equal('ci' in card(ticket({ ci: { state: 'passed', checks: [], failing: [] } })), false, 'never the whole object');
+  assert.equal('ciState' in card(ticket()), false);
+});
+
+// A park on a locked file keeps its recovery details on every form that keeps the ticket's row.
+test('a card keeps a parked ticket\'s locked-file recovery details, bounded, with no undefined', () => {
+  const holes = (v, at = '') => (v === undefined ? [at] : v && typeof v === 'object' ? Object.entries(v).flatMap(([k, x]) => holes(x, `${at}.${k}`)) : []);
+  const lock = { file: '.review-tmp/VBCSCompiler/x.dll', hint: 'dotnet', stashBefore: 'a'.repeat(40), stashAfter: 'b'.repeat(40) };
+  const t = { key: 'A-1', title: 'A', state: 'parked', task: 1, of: 1, phase: null, agent: 'codex', reason: 'locked', pr: null, reviews: 0, latest: null, canRetry: true, giveTo: 'writer', canStop: true, checkpointLock: lock };
+  const s = { id: 's1', name: 'Oct', draft: false, discarded: false, paused: false, finishedAt: null, autoMerge: false, maxParallel: 3, news: 0, tickets: [t, { ...t, key: 'A-2', state: 'running', checkpointLock: undefined }] };
+  const card = sprintCard(s);
+  assert.deepEqual(card.tickets[0].checkpointLock, lock);
+  assert.equal('checkpointLock' in card.tickets[1], false, 'an older ticket gains no field');
+  assert.deepEqual(holes(card), []);
+  assert.deepEqual(holes(sprintCard(card)), [], 'a card made from a card');
+  assert.deepEqual(sprintCard(card).tickets[0].checkpointLock, lock, 'kept twice over');
+  // A filename past what the engine sends is cut, so locks cannot outgrow the Client props.
+  const long = sprintCard({ ...s, tickets: [{ ...t, checkpointLock: { ...lock, file: 'x'.repeat(2000) } }] }).tickets[0].checkpointLock;
+  assert.equal(long.file.length, 1024);
+  assert.match(long.file, /…$/);
+  // A lock missing its fields still makes a card with none undefined.
+  const bare = sprintCard({ ...s, tickets: [{ ...t, checkpointLock: {} }] }).tickets[0].checkpointLock;
+  assert.deepEqual(bare, { file: 'an unidentified file', hint: null, stashBefore: null, stashAfter: null });
+});
+
+test('fitModel keeps the open ticket\'s locked-file details, capped or whole, and stays under the budget', () => {
+  const lock = { file: '.review-tmp/VBCSCompiler/AnalyzerAssemblyLoader/x/m.dll', hint: 'dotnet', stashBefore: null, stashAfter: 'c'.repeat(40) };
+  const ticket = (key, state) => ({
+    key, title: `${key} title`, state, task: 1, of: 1, phase: null, agent: 'codex',
+    reason: state === 'parked' ? 'locked' : null, findings: null, pr: null, reviews: 0, latest: null, tasks: [],
+    canRetry: state === 'parked', giveTo: state === 'parked' ? 'writer' : null, canStop: true,
+    ...(state === 'parked' ? { checkpointLock: lock } : {}),
+  });
+  const sprint = { id: 's1', name: 'Oct', draft: false, discarded: false, paused: false, finishedAt: null, autoMerge: false, maxParallel: 3, news: 0, tickets: [ticket('A-1', 'running'), ticket('A-2', 'parked')] };
+  const board = { sprint: 's1', open: 'A-2', confirm: null, picking: null };
+  // Whole: the open ticket's screen keeps the lock.
+  const out = fitModel(paneModelWith([], { sprints: slimSprints([sprint], board), board, view: { screen: 'ticket', id: 's1', key: 'A-2' } }));
+  assert.deepEqual(out.sprints.find((x) => x.id === 's1').tickets.find((x) => x.key === 'A-2').checkpointLock, lock);
+  assert.ok(size(out) <= PROPS_BUDGET, `${size(out)} characters`);
+  // Thirty locked parks still fit beside a history, and the open row keeps its lock.
+  const many = { ...sprint, tickets: Array.from({ length: 30 }, (_, i) => ticket(`A-${i}`, 'parked')) };
+  const roomy = fitModel(paneModelWith(finished(200), { sprints: slimSprints([many], board), board, view: { screen: 'ticket', id: 's1', key: 'A-2' } }));
+  assert.ok(size(roomy) <= PROPS_BUDGET, `${size(roomy)} characters`);
+  assert.deepEqual(roomy.sprints.find((x) => x.id === 's1').tickets.find((x) => x.key === 'A-2').checkpointLock, lock);
+  // Capped past a tight budget: the open board's rows are cut but its open row stays, lock and all.
+  const capped = fitModel(paneModelWith(finished(200), { sprints: slimSprints([many], board), board, view: { screen: 'ticket', id: 's1', key: 'A-2' } }), { budget: 8_000 });
+  assert.ok(size(capped) <= 8_000, `${size(capped)} characters`);
+  const cut = capped.sprints.find((x) => x.id === 's1');
+  assert.ok(cut.more > 0, 'its rows are capped');
+  assert.deepEqual(cut.tickets.find((x) => x.key === 'A-2').checkpointLock, lock);
+  // A capped card keeps the pinned open row's lock too.
+  const pins = capRows(sprintCard(many), CARD_ROWS, ['A-2']);
+  assert.ok(pins.more > 0);
+  assert.deepEqual(pins.tickets.find((x) => x.key === 'A-2').checkpointLock, lock);
 });

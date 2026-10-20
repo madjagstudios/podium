@@ -32,7 +32,7 @@ test('a writer that did not run its tests parks the ticket, and no review starts
 
 test('failed tests park the ticket', async () => {
   const { t } = await parkedWith({ write: 'a.txt', tests: 'failed' });
-  assert.equal(t.reason, "Task 1's tests failed");
+  assert.equal(t.reason, "Task 1's tests failed in Fa's sandbox");
 });
 
 test('a writer that says nothing about its tests parks the ticket', async () => {
@@ -74,7 +74,7 @@ test('a fix whose tests failed parks, and Retry sends the reviewer\'s findings a
   scriptAgent(root, 'fr', [{ say: 'Missing the a test.\nVERDICT: fail' }, { say: 'VERDICT: pass' }, { say: 'VERDICT: pass' }]);
   const s0 = await createSprint(root, { name: 'x', tickets: [T()] }, { cwd: w.repo });
   const parked = await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'parked');
-  assert.equal(parked.tickets[0].reason, "Task 1's tests failed");
+  assert.equal(parked.tickets[0].reason, "Task 1's tests failed in Fa's sandbox");
   assert.equal(parked.tickets[0].resume, 'fix');
   await retryTicket(root, s0.id, 'ABC-11');
   const s = await run(root, s0.id, w.env, (x) => ['pr-open', 'parked'].includes(x.tickets[0].state));
@@ -94,7 +94,7 @@ test('a fix whose tests fail twice still gets the reviewer\'s findings, never it
   assert.match(first.tickets[0].findings, /TESTS: failed/, 'the person sees the fix\'s report');
   await retryTicket(root, s0.id, 'ABC-11');
   const second = await run(root, s0.id, w.env, parked(3));
-  assert.equal(second.tickets[0].reason, "Task 1's tests failed");
+  assert.equal(second.tickets[0].reason, "Task 1's tests failed in Fa's sandbox");
   await retryTicket(root, s0.id, 'ABC-11');
   const s = await run(root, s0.id, w.env, (x) => ['pr-open', 'parked'].includes(x.tickets[0].state));
   assert.equal(s.tickets[0].state, 'pr-open', s.tickets[0].reason);

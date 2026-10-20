@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { saveAdapter } from '../engine/adapters/registry.js';
 import { dispatch } from '../engine/dispatch.js';
-import { readJob } from '../engine/store.js';
+import { readJob, listJobDirs } from '../engine/store.js';
 import { openPr, postReview, reviewPrompt } from '../engine/pr.js';
 import { threadSteps } from '../engine/thread.js';
 import { tempRoot, fakeAdapter, waitFor, ghWorld } from './helpers.js';
@@ -44,6 +44,36 @@ test('a review runs read-only on the PR head in its own copy and can be posted a
   await assert.rejects(postReview(root, job.id, { env: w.env }), (e) => e.code === 'already-posted');
 });
 
+test('a review with a follow-up is refused before anything is created', async () => {
+  const root = tempRoot();
+  saveAdapter(root, fakeAdapter('ok'));
+  const w = ghWorld([{ match: ['pr', 'view'], stdout: VIEW }, { match: ['pr', 'review'], stdout: '' }]);
+  w.git(w.repo, 'push', '-q', 'origin', 'HEAD:refs/pull/7/head');
+  const res = await dispatch(root, { agent: 'fake', cwd: w.repo, prompt: 'Focus on error handling', review: 7, env: w.env });
+  const review = await finished(res.dir);
+  const jobsBefore = listJobDirs(root).length;
+  const callsBefore = w.calls().length;
+  await assert.rejects(
+    dispatch(root, { agent: 'fake', cwd: w.repo, prompt: 'Look again', review: 7, followUp: review.id, env: w.env }),
+    (e) => e.code === 'review-follow-up',
+  );
+  assert.equal(listJobDirs(root).length, jobsBefore);
+  assert.equal(w.calls().length, callsBefore);
+});
+
+test('a finished review with no host job cannot be continued', async () => {
+  const root = tempRoot();
+  saveAdapter(root, fakeAdapter('ok'));
+  const w = ghWorld([{ match: ['pr', 'view'], stdout: VIEW }]);
+  w.git(w.repo, 'push', '-q', 'origin', 'HEAD:refs/pull/7/head');
+  const res = await dispatch(root, { agent: 'fake', cwd: w.repo, prompt: '', review: 7, env: w.env });
+  const review = await finished(res.dir);
+  await assert.rejects(
+    dispatch(root, { agent: 'fake', cwd: w.repo, prompt: 'Look again', followUp: review.id, env: w.env }),
+    (e) => e.code === 'review-not-continuable',
+  );
+});
+
 test('a review of a Podium PR joins its thread without becoming the step to continue', async () => {
   const root = tempRoot();
   saveAdapter(root, fakeAdapter('edit'));
@@ -57,4 +87,20 @@ test('a review of a Podium PR joins its thread without becoming the step to cont
   assert.equal(review.threadId, opened.threadId);
   assert.equal(threadSteps(root, opened).some((s) => s.id === review.id), false);
   assert.ok(fs.existsSync(opened.worktree), "the PR's own copy is untouched");
+});
+
+test('a review with a host job cannot be continued either', async () => {
+  const root = tempRoot();
+  saveAdapter(root, fakeAdapter('edit'));
+  const w = ghWorld([{ match: ['pr', 'create'], stdout: 'https://github.com/o/r/pull/12\n' }, { match: ['pr', 'view'], stdout: { ...VIEW, url: 'https://github.com/o/r/pull/12' } }]);
+  const first = await dispatch(root, { agent: 'fake', permission: 'edit-worktree', cwd: w.repo, prompt: 'Add the fake file', ticket: 'ABC-12' });
+  const opened = await openPr(root, (await finished(first.dir)).id, { env: w.env });
+  w.git(w.repo, 'push', '-q', 'origin', `${opened.pr.branch}:refs/pull/12/head`);
+  saveAdapter(root, fakeAdapter('ok'));
+  const res = await dispatch(root, { agent: 'fake', cwd: w.repo, prompt: '', review: 12, env: w.env });
+  const review = await finished(res.dir);
+  await assert.rejects(
+    dispatch(root, { agent: 'fake', cwd: w.repo, prompt: 'Look again', followUp: review.id, env: w.env }),
+    (e) => e.code === 'review-not-continuable',
+  );
 });

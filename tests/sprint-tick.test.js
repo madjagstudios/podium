@@ -43,7 +43,8 @@ test('a ticket runs task by task with a review after each, then opens its PR', a
   assert.equal(create[create.indexOf('--title') + 1], 'ABC-11: Login form');
   const reviews = jobsBy(root, 'reviewer');
   assert.equal(reviews.length, 2);
-  assert.equal(reviews[0].permission, 'read-only');
+  // In the ticket's own copy, where it may run the tests; the copy is put back after.
+  assert.equal(reviews[0].permission, 'edit-worktree');
   assert.match(promptOf(root, reviews[0]), /a\.txt/);
   assert.doesNotMatch(promptOf(root, reviews[0]), /b\.txt/);
   assert.match(promptOf(root, reviews[1]), /b\.txt/);

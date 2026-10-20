@@ -102,3 +102,23 @@ test('result --full includes the tail of the agent activity log', () => {
   assert.equal(r.log, 'exec seq 1 90\n1\n2\n');
   assert.equal(result(root, job.id).log, null);
 });
+
+test('an agent lingers while its runner never saw it end, its pid is alive and recorded since the machine started, within the wait', async () => {
+  const { agentLingers, agentAlive, AGENT_WAIT_MS } = await import('../engine/status.js');
+  const now = Date.now();
+  const lost = { status: 'lost', agentPid: process.pid, startedAt: new Date(now - 60_000).toISOString(), endedAt: new Date(now - 1000).toISOString() };
+  const bootAt = now - 3_600_000;
+  assert.equal(agentLingers(lost, { now, bootAt }), true);
+  for (const status of ['failed', 'cancelled']) assert.equal(agentLingers({ ...lost, status }, { now, bootAt }), true, status);
+  // Its runner saw it end, or it is still the runner's: not lingering.
+  assert.equal(agentLingers({ ...lost, status: 'failed', exitCode: 1 }, { now, bootAt }), false);
+  for (const status of ['running', 'queued', 'done', 'needs-review']) assert.equal(agentLingers({ ...lost, status }, { now, bootAt }), false, status);
+  // A pid recorded before the machine started, or none, or a dead one.
+  assert.equal(agentLingers(lost, { now, bootAt: now - 30_000 }), false);
+  assert.equal(agentLingers({ ...lost, agentPid: null }, { now, bootAt }), false);
+  const dead = spawnSync(process.execPath, ['-e', '']).pid;
+  assert.equal(agentLingers({ ...lost, agentPid: dead }, { now, bootAt }), false);
+  // Past the longest wait it no longer holds anything up, though its pid is alive still.
+  const later = now + AGENT_WAIT_MS;
+  assert.deepEqual([agentLingers(lost, { now: later, bootAt }), agentAlive(lost, { bootAt })], [false, true]);
+});

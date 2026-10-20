@@ -68,8 +68,36 @@ switch (mode) {
     const queue = JSON.parse(fs.readFileSync(file, 'utf8'));
     const step = queue.shift() ?? { say: 'nothing scripted' };
     fs.writeFileSync(file, JSON.stringify(queue));
+    let failed = false;
     // A step can clear a path first (an agent tidying its own mistake).
     if (step.rm) fs.rmSync(path.resolve(step.rm), { recursive: true, force: true });
+    // A step can switch to a new branch first (branch), or make a git repo in its temp folder, as a test fixture would.
+    if (step.branch) execFileSync('git', ['checkout', '-q', '-b', step.branch], { stdio: 'pipe' });
+    if (step.detach) execFileSync('git', ['checkout', '-q', '--detach'], { stdio: 'pipe' });
+    const run = (...a) => { try { execFileSync('git', ['-c', 'user.name=Fake', '-c', 'user.email=fake@example.com', ...a], { stdio: 'pipe' }); } catch { /* a conflict or a stop exits non-zero */ } };
+    // A rebase stopped part way (its exec fails after replaying the last commit), whose commit is then amended.
+    if (step.rebaseStuck) {
+      run('rebase', '--no-ff', '-x', 'exit 1', 'HEAD~1');
+      fs.writeFileSync('amended.txt', 'amended\n');
+      run('add', 'amended.txt');
+      run('commit', '--amend', '-qm', 'amended in a rebase');
+    }
+    // A merge left half done: another side of a.txt merged in, conflicting, and never finished.
+    if (step.mergeConflict) {
+      const here = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { stdio: 'pipe' }).toString().trim();
+      run('checkout', '-q', '-b', 'other-side', 'HEAD~1');
+      fs.writeFileSync('a.txt', 'the other side\n');
+      run('add', 'a.txt');
+      run('commit', '-qm', 'other side');
+      run('checkout', '-q', here);
+      run('merge', 'other-side');
+    }
+    if (step.repoInTmp) {
+      const fixture = path.join(process.env.TMPDIR ?? '.', 'fixture');
+      fs.mkdirSync(fixture, { recursive: true });
+      execFileSync('git', ['init', '-q', fixture], { stdio: 'pipe' });
+      fs.writeFileSync(path.join(fixture, 'f.txt'), 'x\n');
+    }
     if (step.write) {
       // A plan goes into docs/plans, which a new copy may not have yet.
       fs.mkdirSync(path.dirname(path.resolve(step.write)), { recursive: true });
@@ -86,14 +114,41 @@ switch (mode) {
       git('add', '-A');
       git('-c', 'user.name=Fake', '-c', 'user.email=fake@example.com', 'commit', '-qm', step.commit);
     }
+    // A fixed disposable-fixture .NET build (test-only): only `dotnetBuild: true` runs it, with the job's working
+    // directory, captured output, and a generous bounded timeout. It never accepts an arbitrary shell snippet.
+    if (step.dotnetBuild === true) {
+      const runDotnet = (...a) => execFileSync('dotnet', a, { stdio: 'pipe', timeout: 600_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true });
+      try {
+        console.log(runDotnet('restore', 'Probe.sln', '--configfile', 'NuGet.Config').toString('utf8'));
+        console.log(runDotnet('build', 'Probe.sln', '--no-restore', '-t:Rebuild', '-p:UseSharedCompilation=false').toString('utf8'));
+        console.log('DOTNET_BUILD ok');
+      } catch (error) {
+        if (error.stdout) console.log(error.stdout.toString('utf8'));
+        if (error.stderr) console.error(error.stderr.toString('utf8'));
+        console.error(`DOTNET_BUILD failed: ${error.message}`);
+        failed = true;
+      }
+    }
     // A writer's report of its tests, only from a step that writes a file or sets tests (a reviewer's step
     // prints none; a planner's plan file prints one, which nothing reads): "TESTS: passed" unless the step says
     // otherwise (tests: 'not-run', 'failed', 'none-needed: why', or false for no line). Printed before `say`.
     if (step.tests !== undefined ? step.tests !== false : Boolean(step.write)) console.log(`TESTS: ${step.tests ?? 'passed'}`);
+    // An environment variable the run saw (env: 'TMPDIR'), and whether that folder can be written.
+    if (step.env) {
+      const value = process.env[step.env] ?? '';
+      let writable = false;
+      try { fs.writeFileSync(path.join(value, 'probe.txt'), 'x'); writable = true; } catch { /* not writable */ }
+      console.log(`ENV ${step.env}=${value} writable=${writable}`);
+    }
+    // A bounded list of environment values, separate from the writable-directory probe above.
+    if (Array.isArray(step.envValues)) {
+      const names = step.envValues.slice(0, 32).filter((name) => typeof name === 'string' && /^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(name));
+      console.log(`ENV_VALUES ${JSON.stringify(Object.fromEntries(names.map((name) => [name, process.env[name] ?? null])))}`);
+    }
     if (step.say) console.log(step.say);
     if (step.err) console.error(step.err);
     if (step.ms) await new Promise((r) => setTimeout(r, step.ms));
-    process.exit(step.exit ?? 0);
+    process.exit(step.exit ?? (failed ? 1 : 0));
   }
   default: console.error(`unknown mode ${mode}`); process.exit(2);
 }

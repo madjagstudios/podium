@@ -36,13 +36,19 @@ const cut = (s, max) => (typeof s === 'string' && s.length > max ? `${s.slice(0,
 // Sprint tickets waiting on the person, across every sprint (Your turn), whichever page of sprints the list shows:
 // parked, or a plan waiting for an answer. Drafts never wait on anyone. At most TURN_TICKETS; `more` counts the rest.
 export const TURN_TICKETS = 20;
+// How many production commands a waiting plan runs: those listed, those past the list, or a card's count.
+const flaggedIn = (t) => ((t.attention?.length ?? 0) + (t.attentionMore ?? 0)) || (t.attentionCount ?? 0);
+
 export function turnTickets(list) {
   const out = [];
   for (const s of (list ?? []).filter(isOpenSprint)) {
     if (s.unreadable || s.draft) continue;
     for (const t of s.tickets ?? []) {
       if (!NEEDS_YOU_STATES.has(t.state)) continue;
-      out.push({ sprint: s.id, sprintName: cut(String(s.name ?? s.id), 60), key: t.key, title: cut(String(t.title ?? ''), 80), state: t.state, reason: cut(String(t.reason ?? ''), 160) });
+      out.push({
+        sprint: s.id, sprintName: cut(String(s.name ?? s.id), 60), key: t.key, title: cut(String(t.title ?? ''), 80), state: t.state, reason: cut(String(t.reason ?? ''), 160),
+        ...(flaggedIn(t) ? { attentionCount: flaggedIn(t) } : {}),
+      });
     }
   }
   return { tickets: out.slice(0, TURN_TICKETS), more: Math.max(0, out.length - TURN_TICKETS) };
@@ -57,13 +63,18 @@ export const PLAN_ROWS = 30;
 // What the pane draws from a sprint: open sprints and finished ones (the Done and Other chats
 // folds list them and their boards open), no other sprint whose tickets have all ended; review findings only on a parked
 // ticket, whose open row shows them, cut short; short task titles; a waiting plan's first PLAN_ROWS task titles, cut short,
-// and how many more (never the plan's text), only for the open board's open row (board: { sprint, open }), the one row that draws them.
+// and how many more (never the plan's text), the production commands it runs, and the person's latest notes, only for the
+// open board's open row (board: { sprint, open }), the one row that draws them; the other rows count those commands.
 export function slimSprints(list, board = null) {
   const isOpenRow = (s, t) => Boolean(board?.open) && board.sprint === s.id && board.open === t.key;
   return (list ?? []).filter((s) => isOpenSprint(s) || isFinishedSprint(s)).map((s) => ({
     ...s,
-    tickets: s.tickets.map(({ findings, tasks, proposed, ...t }) => ({
+    tickets: s.tickets.map(({ findings, tasks, proposed, notes, attention, attentionMore, ...t }) => ({
       ...t,
+      ...(Array.isArray(notes) && notes.length && isOpenRow(s, t) ? { notes } : {}),
+      ...(flaggedIn({ attention, attentionMore })
+        ? (isOpenRow(s, t) && attention?.length ? { attention, ...(attentionMore ? { attentionMore } : {}) } : { attentionCount: flaggedIn({ attention, attentionMore }) })
+        : {}),
       ...(t.state === 'parked' && findings ? { findings: findings.length > FINDINGS_LIMIT ? `${findings.slice(0, FINDINGS_LIMIT - 1)}…` : findings } : {}),
       ...(tasks ? { tasks: tasks.map((x) => ({ ...x, title: shorten(x.title, TASK_TITLE_LIMIT) })) } : {}),
       ...(Array.isArray(proposed) && isOpenRow(s, t) ? {
@@ -138,15 +149,25 @@ const CUTS = [2000, 1000, 500, 250, 120, 60, 30];
 const REASON_CHARS = 160;
 const unique = (list) => [...new Set(list)];
 // A ticket's plan buttons' state, sent only when the summary has it (the page refuses a Client prop that is undefined).
-const PLAN_FLAGS = ['canApprove', 'canRevise', 'canOneTask', 'canAssignPlan'];
+const PLAN_FLAGS = ['canApprove', 'canRevise', 'canOneTask', 'canAssignPlan', 'canNote', 'canAccept', 'canEvidence'];
 // Fields the summary did not have are left out, not sent as undefined (the page refuses a Client prop that is undefined).
 const defined = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined));
+// A ticket's locked-file recovery details for its card: the blocked file (cut only past what the engine ever
+// sends, so the ticket's screen names it whole even when the card's reason was cut), the .NET hint, and the
+// stash refs Git had before and after. Missing fields become null or the engine's own fallback, never undefined.
+const LOCK_FILE_CHARS = 1024;
+const lockCard = (lock) => ({
+  file: typeof lock?.file === 'string' && lock.file ? cut(lock.file, LOCK_FILE_CHARS) : 'an unidentified file',
+  hint: lock?.hint ?? null,
+  stashBefore: lock?.stashBefore ?? null,
+  stashAfter: lock?.stashAfter ?? null,
+});
 export function sprintCard(s, max = TASK_TITLE_LIMIT) {
   if (s.unreadable) return defined({ ...s, name: cut(s.name, max), unreadable: cut(s.unreadable, Math.max(max * 4, 120)), brief: true });
   return defined({
     id: s.id, name: cut(s.name, max), draft: s.draft, discarded: s.discarded, paused: s.paused, finishedAt: s.finishedAt,
-    autoMerge: s.autoMerge, maxParallel: s.maxParallel, news: s.news, check: s.check, chat: s.chat, brief: true,
-    // A draft's proposed commands and check: the board's This repo fold.
+    autoMerge: s.autoMerge, maxParallel: s.maxParallel, news: s.news, check: s.check, chat: s.chat, base: s.base, brief: true,
+    // A draft's proposed commands, check and plans folder: the board's This repo fold.
     ...(s.proposed ? { proposed: s.proposed } : {}),
     ...(typeof s.headline === 'string' ? { headline: s.headline } : {}), ...(typeof s.status === 'string' ? { status: s.status } : {}), ...(typeof s.tone === 'string' ? { tone: s.tone } : {}), ...(s.more > 0 ? { more: s.more } : {}),
     ...(s.ended === true ? { ended: true } : {}),
@@ -156,9 +177,17 @@ export function sprintCard(s, max = TASK_TITLE_LIMIT) {
       key: t.key, title: cut(t.title, max), state: t.state, task: t.task, of: t.of, phase: t.phase, agent: t.agent,
       reason: cut(t.reason, Math.min(REASON_CHARS, max * 2)), pr: t.pr ?? null, reviews: t.reviews, latest: t.latest,
       canRetry: t.canRetry, giveTo: t.giveTo, canStop: t.canStop, ...(t.pos !== undefined ? { pos: t.pos } : {}), ...(t.slot ? { slot: t.slot } : {}),
+      // Sync with base, and Keep or Drop for commits Podium didn't make.
+      ...(t.canSync ? { canSync: true } : {}), ...(t.baselineOf ? { baselineOf: t.baselineOf } : {}), ...(t.testsWhere ? { testsWhere: t.testsWhere } : {}), ...(t.agentLeft ? { agentLeft: true } : {}), ...(t.foreignCommits ? { foreignCommits: { count: t.foreignCommits.count, newest: cut(t.foreignCommits.newest, max * 2) } } : {}),
+      // How the PR's CI stands for what its plan left to it: one flat word, never the whole object.
+      ...(typeof t.ci?.state === 'string' ? { ciState: t.ci.state } : {}),
       // What its row reads (who plans it, what it waits for) and its buttons' state; the plan's tasks only on the open board.
       plan: cut(t.plan ?? null, 200), writer: t.writer ?? null, reviewer: t.reviewer ?? null, after: t.after ?? [], waitingOn: t.waitingOn ?? [],
       ...Object.fromEntries(PLAN_FLAGS.filter((k) => t[k] !== undefined).map((k) => [k, t[k] === true])),
+      // How many production commands its plan runs (their lines only on the open board): Approve asks first.
+      ...(flaggedIn(t) ? { attentionCount: flaggedIn(t) } : {}),
+      // A park on a locked file: what to release and how to retry (the ticket's screen reads it).
+      ...(t.checkpointLock ? { checkpointLock: lockCard(t.checkpointLock) } : {}),
       ...(s.draft && Array.isArray(t.tasks) ? { writers: unique(t.tasks.map((x) => x.agent)), reviewers: unique(t.tasks.map((x) => x.reviewer)) } : {}),
     })),
   });

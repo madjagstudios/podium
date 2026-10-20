@@ -19,7 +19,7 @@ import type { Palette, Tone } from './theme'
 import { choices, fold, row, tile } from './tiles'
 import { doneText, quietText, toneOf, turnItems, isFailedTurn, workingRowLine, doneRowLine, prSub, setupSummary, sprintRowTitle, sprintTone, ticketTone, finishedTone, jobTone } from '../mod/view.js'
 import { isFinishedSprint, finishedSprints, finishedSprintLine, finishedSprintTone, isSprintMine, sprintWorkingLine, olderSprintsLine, FINISHED_SPRINTS, FROM_OTHER_CHAT } from '../mod/view.js'
-import { attentionLine, isFoldOpen, jobStatusLine, jobDetails, fromAnotherChat, REVIEW_WORDS, ticketStatusLine, whoLine } from '../mod/view.js'
+import { attentionLine, isFoldOpen, jobStatusLine, jobDetails, fromAnotherChat, REVIEW_WORDS, ticketStatusLine, whoLine, noteReaders, testsParkHint, acceptLine, evidenceLine, attentionHead, ackQuestion, ackUnseen, flaggedOf, checkpointLockHint, ticketRetryLabel } from '../mod/view.js'
 
 
 export type Ui = any // the element table $.ui.resolve(e) returned for the drawing surface
@@ -62,8 +62,13 @@ export type ListHandlers = {
   assignTask: (id: string, key: string, n: number, role: 'agent' | 'reviewer', name: string) => void
   retryTicket: (id: string, key: string, agent?: string) => void
   stopTicket: (id: string, key: string) => void
-  approvePlan: (id: string, key: string, whole?: boolean) => void
+  syncTicket: (id: string, key: string) => void
+  answerCommits: (id: string, key: string, keep: boolean) => void
+  approvePlan: (id: string, key: string, whole?: boolean, acknowledge?: boolean) => void
   revisePlan: (id: string, key: string, text?: string) => void
+  addNote: (id: string, key: string, text?: string) => void
+  acceptTests: (id: string, key: string, text?: string) => void
+  reviewWithEvidence: (id: string, key: string, text?: string) => void
   editNote: (id: string, text: string) => void
   setAfter: (id: string, key: string, other: string, on: boolean) => void
   takeSprintNews: (id: string) => void
@@ -222,7 +227,7 @@ export function boardScreen(ui: Ui, p: Palette, s: SprintSummary | undefined, bo
   if (!draft && !s.archived && (s.news ?? 0) > 0 && session && s.chat && s.chat !== session) {
     parts.push(
       <Text key="board-news" color={p.dim} wrap="wrap">{waitingNews(s.news)}</Text>,
-      <Box key="board-news-links" flexDirection="row"><Button key="link-take-news" plain label="Take them here (if its chat is closed)"onPress={() => go.takeSprintNews(s.id)} /></Box>,
+      <Box key="board-news-links" flexDirection="row"><Button key="link-take-news" plain label="Take them here (if its chat is closed)" onPress={() => go.takeSprintNews(s.id)} /></Box>,
     )
   }
   // Sent as its list row when the desktop model was cut to fit (no tickets): opened before Podium sent the board.
@@ -257,6 +262,9 @@ export function boardScreen(ui: Ui, p: Palette, s: SprintSummary | undefined, bo
       <Text key="board-repo-what" color={p.dim} wrap="wrap">Claude proposed these. They are saved for this repo when you start the sprint; Discard drops them.</Text>,
       ...(Array.isArray(pr.commands) ? [<Text key="board-repo-commands" wrap="wrap">{`Commands agents may run: ${pr.commands.join(' ') || 'none'}`}</Text>] : []),
       ...(typeof pr.check === 'string' ? [<Text key="board-repo-check" wrap="wrap">{pr.check ? `Full check: ${pr.check}` : 'Full check: none (removes this repo\'s check)'}</Text>] : []),
+      ...(typeof pr.taskTest === 'string' ? [<Text key="board-repo-task-test" wrap="wrap">{pr.taskTest ? `Task test after each writer: ${pr.taskTest}` : 'Task test: none (removes this repo\'s task test)'}</Text>] : []),
+      ...(typeof pr.planDir === 'string' ? [<Text key="board-repo-plan-dir" wrap="wrap">{pr.planDir ? `Plans folder: ${pr.planDir}` : 'Plans folder: default (removes this repo\'s plans folder)'}</Text>] : []),
+      ...(typeof pr.keepPlan === 'boolean' ? [<Text key="board-repo-keep-plan" wrap="wrap">{pr.keepPlan ? 'Plans: kept in each PR' : 'Plans: left out of PRs (removes this repo\'s choice)'}</Text>] : []),
     ]))
   }
   const oid = `board:${s.id}:options`
@@ -367,7 +375,19 @@ export function ticketScreen(ui: Ui, p: Palette, s: SprintSummary | undefined, k
   const mineBoard = board.sprint === s.id
   const picking = mineBoard ? (board.picking ?? null) : null
   const revising = mineBoard && board.confirm === `revise:${t.key}`
+  const noting = Boolean(t.canNote) && mineBoard && board.confirm === `note:${t.key}`
+  const accepting = Boolean(t.canAccept) && mineBoard && board.confirm === `accept:${t.key}`
+  const evidencing = Boolean(t.canEvidence) && mineBoard && board.confirm === `evidence:${t.key}`
   const stopping = mineBoard && board.confirm === `stop:${t.key}`
+  // Commits in its copy that Podium didn't make: Keep, or Drop after asking.
+  const foreign = t.foreignCommits ?? null
+  const dropping = Boolean(foreign) && mineBoard && board.confirm === `drop:${t.key}`
+  // Production commands its plan runs (their lines on the open board, a count on a brief card): Approve asks first.
+  const attention = t.attention ?? []
+  const flagged = flaggedOf(t)
+  // Every one of them shown here, so the person may agree to them here.
+  const allShown = attention.length > 0 && attention.length === flagged
+  const acking = flagged > 0 && Boolean(t.canApprove || t.canOneTask) && mineBoard && board.confirm === `ack:${t.key}`
   const parts: unknown[] = [
     back,
     // The key, title and status line in one tile, coloured as the ticket's board line is.
@@ -384,28 +404,70 @@ export function ticketScreen(ui: Ui, p: Palette, s: SprintSummary | undefined, k
     for (const x of proposed) parts.push(<Text key={`proposed-${x.n}`} wrap="truncate-end">{`· Task ${x.n}: ${x.title}`}</Text>)
     if (t.proposedMore) parts.push(<Text key="proposed-more" color={p.dim}>{`… and ${t.proposedMore} more tasks`}</Text>)
   }
+  if (flagged) {
+    parts.push(<Text key="attention-head" bold color={p.needs.text} wrap="wrap">{`${attentionHead(flagged)}${attention.length ? ':' : '.'}`}</Text>)
+    attention.forEach((x, i) => parts.push(<Text key={`attention-${i}`} wrap="wrap">{`· Task ${x.n}: ${x.command}`}</Text>))
+    if (attention.length && flagged > attention.length) parts.push(<Text key="attention-more" color={p.dim}>{`… and ${flagged - attention.length} more in the plan`}</Text>)
+  }
   if (t.state === 'parked' && t.findings) parts.push(<Text key="findings" color={p.dim} wrap="wrap">{t.findings}</Text>)
+  if (t.canAccept) parts.push(<Text key="tests-hint" color={p.dim} wrap="wrap">{testsParkHint(t)}</Text>)
+  // Parked on a file locked while saving changes: what to release and how to retry. The original failure
+  // details above stay for inspection; Retry below tries the interrupted operation again.
+  const lockHint = checkpointLockHint(t)
+  if (lockHint) {
+    parts.push(<Text key="lock-head" bold>Release and retry</Text>)
+    parts.push(<Text key="lock-hint" wrap="wrap">{lockHint}</Text>)
+  }
   // One next step.
   const step: unknown[] = []
   const giving = picking === `${t.key}:give`
   const stuck = tasks.find((x) => x.status === 'current')
   const current = planless ? (t.writer ?? '') : stuck ? (t.giveTo === 'reviewer' ? stuck.reviewer : stuck.agent) : ''
   const others = agentOptions(agentList).filter((o) => o.value !== current)
-  if (t.canApprove) step.push(<Button key={`approve-${t.key}`} variant="primary" label="Approve plan" onPress={() => go.approvePlan(s.id, t.key)} />)
-  if (t.canOneTask) step.push(<Button key={`one-task-${t.key}`} variant="primary" label="Run as one task" onPress={() => go.approvePlan(s.id, t.key, true)} />)
+  const approve = (whole: boolean) => (flagged ? go.askConfirm(s.id, `ack:${t.key}`) : go.approvePlan(s.id, t.key, whole))
+  if (t.canApprove) step.push(<Button key={`approve-${t.key}`} variant="primary" label={flagged ? 'Approve plan…' : 'Approve plan'} onPress={() => approve(false)} />)
+  if (t.canOneTask) step.push(<Button key={`one-task-${t.key}`} variant="primary" label={flagged ? 'Run as one task…' : 'Run as one task'} onPress={() => approve(true)} />)
   if (t.canRevise && !revising) step.push(<Button key={`revise-${t.key}`} label="Ask for changes…" onPress={() => go.askConfirm(s.id, `revise:${t.key}`)} />)
-  if (t.canRetry) step.push(<Button key={`retry-${t.key}`} variant="primary" label="Retry" onPress={() => go.retryTicket(s.id, t.key)} />)
+  if (t.canRetry) step.push(<Button key={`retry-${t.key}`} variant="primary" label={ticketRetryLabel(t)} onPress={() => go.retryTicket(s.id, t.key)} />)
+  if (t.canEvidence && !evidencing) step.push(<Button key={`evidence-${t.key}`} label="Review again with evidence…" onPress={() => go.askConfirm(s.id, `evidence:${t.key}`)} />)
+  if (t.canAccept && !accepting) step.push(<Button key={`accept-${t.key}`} label="Accept and continue…" onPress={() => go.askConfirm(s.id, `accept:${t.key}`)} />)
   if (t.canRetry && t.giveTo && others.length) step.push(<Button key={`give-${t.key}`} label={giving ? 'Done' : 'Give to another agent…'} onPress={() => go.openPicker(s.id, giving ? null : `${t.key}:give`)} />)
+  if (foreign) {
+    const them = foreign.count === 1 ? 'it' : 'them'
+    step.push(<Button key={`keep-commits-${t.key}`} variant="primary" label={`Keep ${them}`} onPress={() => go.answerCommits(s.id, t.key, true)} />)
+    step.push(<Button key={`end-drop-commits-${t.key}`} label={`Drop ${them}…`} onPress={() => go.askConfirm(s.id, `drop:${t.key}`)} />)
+  }
+  if (t.canSync) step.push(<Button key={`sync-${t.key}`} label={`Sync with ${s.base ?? 'base'}`} onPress={() => go.syncTicket(s.id, t.key)} />)
   // As the one next step it is outlined: not `open-`, which look.tsx draws as a text link on desktop.
   const stepsButton = (primary: boolean) => (primary
     ? <Button key={`steps-${t.key}`} variant="primary" label="Steps and diff" onPress={() => go.openDetail(t.latest as string)} />
     : <Button key={`open-steps-${t.key}`} plain label="Steps and diff" onPress={() => go.openDetail(t.latest as string)} />)
   const stepsIsNext = !step.length && Boolean(t.latest) && t.state === 'running'
   if (stepsIsNext) step.push(stepsButton(true))
-  // A question or form open is the one decision: while the plan's notes are open or Stop asks, the next step
+  // A question or form open is the one decision: while the plan's notes or a note are open or Stop asks, the next step
   // (Approve plan, Run as one task, Retry…) is not drawn, so it can't be pressed with notes unsent; Cancel brings it back.
-  const deciding = (t.canRevise && revising) || (t.canStop && stopping)
+  const deciding = (t.canRevise && revising) || noting || accepting || evidencing || (t.canStop && stopping) || dropping || acking
   if (step.length && !deciding) parts.push(<Box key="next" flexDirection="row" flexWrap="wrap" gap={1}>{step}</Box>)
+  if (foreign && dropping) {
+    parts.push(
+      <Text key="drop-what" wrap="wrap">{`Drop ${foreign.count === 1 ? 'the commit' : `the ${foreign.count} commits`} Podium didn't make? ${t.key}'s copy goes back to where Podium left it.`}</Text>,
+      <Box key="drop-confirm" flexDirection="row" gap={1}>
+        <Button key={`drop-yes-${t.key}`} variant="primary" label="Drop" onPress={() => go.answerCommits(s.id, t.key, false)} />
+        <Button key={`drop-no-${t.key}`} label="Cancel" onPress={() => go.askConfirm(s.id, null)} />
+      </Box>,
+    )
+  }
+  if (acking) {
+    const whole = !t.canApprove
+    // Only commands the person can see here may be agreed to here: with some or all of them not shown, Claude lists them.
+    parts.push(
+      <Text key="ack-what" wrap="wrap">{allShown ? ackQuestion(flagged, whole) : ackUnseen(flagged)}</Text>,
+      <Box key="ack-confirm" flexDirection="row" gap={1}>
+        {allShown ? <Button key={`ack-yes-${t.key}`} variant="primary" label={whole ? 'Run as one task' : 'Approve plan'} onPress={() => go.approvePlan(s.id, t.key, whole, true)} /> : null}
+        <Button key={`ack-no-${t.key}`} label="Cancel" onPress={() => go.askConfirm(s.id, null)} />
+      </Box>,
+    )
+  }
   if (giving && t.canRetry && t.giveTo && !deciding) {
     const what = planless ? 'to write the plan' : `${t.giveTo === 'reviewer' ? 'to review' : 'to write'}${stuck ? ` task ${stuck.n}` : ''}`
     parts.push(choices(ui, p, `giveto-${t.key}`, `Give it to (${what}):`, '', others, (v) => go.retryTicket(s.id, t.key, v)))
@@ -423,10 +485,63 @@ export function ticketScreen(ui: Ui, p: Palette, s: SprintSummary | undefined, k
       </Box>,
     )
   }
-  if (t.latest && (!stepsIsNext || deciding)) parts.push(<Box key="links" flexDirection="row">{stepsButton(false)}</Box>)
+  if (evidencing) {
+    parts.push(
+      <Box key={`evidence-form-${t.key}`} flexDirection="column" gap={1}>
+        <Input key={`evidence-text-${t.key}`} label="What should the reviewer weigh?" placeholder="e.g. CI passed on this commit: https://…" value={board.note ?? ''} submitLabel="Review again"
+          onInput={(v: string) => go.editNote(s.id, v)} onSubmit={(v: string) => go.reviewWithEvidence(s.id, t.key, v)} />
+        <Text color={p.dim} wrap="wrap">{evidenceLine(stuck?.reviewer ?? null)}</Text>
+        <Box flexDirection="row" gap={1}>
+          <Button key={`evidence-save-${t.key}`} variant="primary" label="Review again" onPress={() => go.reviewWithEvidence(s.id, t.key, board.note ?? '')} />
+          <Button key={`evidence-cancel-${t.key}`} label="Cancel" onPress={() => go.askConfirm(s.id, null)} />
+        </Box>
+      </Box>,
+    )
+  }
+  if (accepting) {
+    // A card sent without its tasks has no task reviewer: the line then names none.
+    const reviewer = stuck?.reviewer ?? null
+    parts.push(
+      <Box key={`accept-form-${t.key}`} flexDirection="column" gap={1}>
+        <Input key={`accept-text-${t.key}`} label="Why are these test results fine?" placeholder="e.g. the date tests fail on main too" value={board.note ?? ''} submitLabel="Accept"
+          onInput={(v: string) => go.editNote(s.id, v)} onSubmit={(v: string) => go.acceptTests(s.id, t.key, v)} />
+        <Text color={p.dim} wrap="wrap">{acceptLine(reviewer)}</Text>
+        <Box flexDirection="row" gap={1}>
+          <Button key={`accept-save-${t.key}`} variant="primary" label="Accept and continue" onPress={() => go.acceptTests(s.id, t.key, board.note ?? '')} />
+          <Button key={`accept-cancel-${t.key}`} label="Cancel" onPress={() => go.askConfirm(s.id, null)} />
+        </Box>
+      </Box>,
+    )
+  }
+  if (noting) {
+    parts.push(
+      <Box key={`note-form-${t.key}`} flexDirection="column" gap={1}>
+        <Input key={`note-text-${t.key}`} label={`A note for ${t.key}'s agents`} placeholder="e.g. the date tests fail on main too: leave them" value={board.note ?? ''} submitLabel="Save"
+          onInput={(v: string) => go.editNote(s.id, v)} onSubmit={(v: string) => go.addNote(s.id, t.key, v)} />
+        <Text color={p.dim} wrap="wrap">{noteReaders(t.key, t.state === 'running')}</Text>
+        <Box flexDirection="row" gap={1}>
+          <Button key={`note-save-${t.key}`} variant="primary" label="Save note" onPress={() => go.addNote(s.id, t.key, board.note ?? '')} />
+          <Button key={`note-cancel-${t.key}`} label="Cancel" onPress={() => go.askConfirm(s.id, null)} />
+        </Box>
+      </Box>,
+    )
+  }
+  const links: unknown[] = []
+  if (t.latest && (!stepsIsNext || deciding)) links.push(stepsButton(false))
+  if (t.canNote && !deciding) links.push(<Button key={`link-note-${t.key}`} plain label="Add a note…" onPress={() => go.askConfirm(s.id, `note:${t.key}`)} />)
+  if (links.length) parts.push(<Box key="links" flexDirection="row" flexWrap="wrap" gap={1}>{links}</Box>)
   // Folded detail.
   const fid = (name: string) => `ticket:${s.id}:${t.key}:${name}`
   const f = (name: string, title: string, summary: string, body: () => unknown[]) => fold(ui, p, fid(name), title, summary, isFoldOpen(folds, fid(name)), () => go.toggleFold(fid(name)), body)
+  // The notes come only with the open ticket's row (slimSprints): drawn once they are here.
+  const notes = t.notes ?? []
+  const noteCount = Math.max(t.noteCount ?? 0, notes.length)
+  if (notes.length) {
+    parts.push(f('notes', 'Your notes', String(noteCount), () => [
+      ...notes.map((x) => <Text key={`note-${t.key}-${x.n}`} wrap="wrap">{`${x.n}. ${x.text}`}</Text>),
+      ...(noteCount > notes.length ? [<Text key="notes-older" color={p.dim}>{`${noteCount - notes.length} older not shown here`}</Text>] : []),
+    ]))
+  }
   parts.push(f('who', 'Who works on it', whoLine(t), () => whoRows(ui, p, s, t, picking, agentList, go)))
   const after = t.after ?? []
   const otherKeys = [...new Set([...s.tickets.map((x) => x.key), ...after])].filter((k) => k !== t.key)
@@ -988,8 +1103,9 @@ const mergeChoice = (m: unknown) => {
   return MERGE_CHOICES.some((o) => o.value === v) ? v : 'default'
 }
 
-// Settings → This repo: the commands agents may run while editing, the full check before a sprint ticket's PR, one
-// commit per sprint PR, and the merge method; each saves for the repo this chat is in (`here`).
+// Settings → This repo: the commands agents may run while editing, the full check before a sprint ticket's PR, the task
+// test after each writer's step, the folder sprint plans go in, whether a sprint PR keeps its plan, one commit per sprint
+// PR, and the merge method; each saves for the repo this chat is in (`here`).
 function repoRows(ui: Ui, p: Palette, s: Record<string, any>, go: FormHandlers) {
   const { Text, Button, Input } = ui
   const here = s.here ?? null
@@ -998,6 +1114,9 @@ function repoRows(ui: Ui, p: Palette, s: Record<string, any>, go: FormHandlers) 
   const listed = s.repoCommands?.[here]
   const commands: string[] = Array.isArray(listed) ? listed.filter((c: unknown) => typeof c === 'string') : []
   const check = s.repoCheck?.[here]
+  const taskTest = s.repoTaskTest?.[here]
+  const planDir = s.repoPlanDir?.[here]
+  const keepPlan = s.repoKeepPlan?.[here] === true
   const squash = s.repoSquash?.[here] !== false
   return [
     <Text key="repo-name" color={p.dim} wrap="wrap">{`For ${here}.`}</Text>,
@@ -1005,6 +1124,11 @@ function repoRows(ui: Ui, p: Palette, s: Record<string, any>, go: FormHandlers) 
       onSubmit={(v: string) => go.setRepoSetting('repoCommands', v.split(/[\s,]+/).filter(Boolean))} />,
     <Input key="repo-check" label="Full check before a sprint PR" value={typeof check === 'string' ? check : ''} placeholder="e.g. dotnet build && dotnet test"
       onSubmit={(v: string) => go.setRepoSetting('repoCheck', v.trim())} />,
+    <Input key="repo-task-test" label="Task test, run on this machine after each writer's step" value={typeof taskTest === 'string' ? taskTest : ''} placeholder="e.g. dotnet test"
+      onSubmit={(v: string) => go.setRepoSetting('repoTaskTest', v.trim())} />,
+    <Input key="repo-plan-dir" label="Folder for sprint plans" value={typeof planDir === 'string' ? planDir : ''} placeholder="docs/plans"
+      onSubmit={(v: string) => go.setRepoSetting('repoPlanDir', v.trim())} />,
+    <Button key="repo-keep-plan" plain label={`${keepPlan ? '☑' : '☐'} Keep sprint plans in the PR`} onPress={() => go.setRepoSetting('repoKeepPlan', keepPlan ? null : true)} />,
     <Button key="repo-squash" plain label={`${squash ? '☑' : '☐'} One commit per sprint PR`} onPress={() => go.setRepoSetting('repoSquash', squash ? false : null)} />,
     choices(ui, p, 'repo-merge', 'Merge method', mergeChoice(s.repoMergeMethod?.[here]), MERGE_CHOICES, (v) => go.setRepoSetting('repoMergeMethod', v === 'default' ? null : v)),
   ]
@@ -1253,7 +1377,7 @@ export const HANDLER_NAMES = [
   'watchAgain', 'postReview', 'reviewOpen', 'fixOpen', 'setInstructions', 'setRepoInstructions', 'setRepoSetting', 'gotIt', 'toggleWhatsNew',
   'dismissWhatsNew', 'checkAgain', 'planRemoval', 'confirmRemoval', 'cancelRemoval',
   'openBoard', 'showSprints', 'sprintAct', 'askConfirm', 'setSprintOptions',
-  'openTicket', 'openPicker', 'moveTicket', 'removeTicket', 'assignTicket', 'assignTask', 'retryTicket', 'stopTicket',
-  'backToList', 'approvePlan', 'revisePlan', 'editNote', 'setAfter', 'takeSprintNews',
+  'openTicket', 'openPicker', 'moveTicket', 'removeTicket', 'assignTicket', 'assignTask', 'retryTicket', 'stopTicket', 'syncTicket', 'answerCommits',
+  'backToList', 'approvePlan', 'revisePlan', 'addNote', 'acceptTests', 'reviewWithEvidence', 'editNote', 'setAfter', 'takeSprintNews',
   'toggleFold', 'confirmJob', 'openAgent', 'browsePr',
 ] as const

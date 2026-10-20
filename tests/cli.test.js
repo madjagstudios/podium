@@ -31,6 +31,20 @@ test('unknown commands and missing options return structured errors', () => {
   assert.match(missing.body.error.message, /--id/);
 });
 
+test('a Git failure keeps raw diagnostic output out of the CLI response', () => {
+  const root = tempRoot();
+  const repo = tempRoot();
+  execFileSync('git', ['init', '-q'], { cwd: repo }); // No HEAD yet: creating the copy fails.
+  podium(root, ['adapter', 'save', '--json', '-'], { input: JSON.stringify(fakeAdapter('unused')) });
+  const result = podium(root, ['dispatch', '--agent', 'fake', '--permission', 'edit-worktree', '--prompt', '-'], {
+    cwd: repo, input: 'Never started',
+  });
+  assert.equal(result.code, 1);
+  assert.equal(result.body.error.code, 'git-failed');
+  assert.match(result.body.error.message, /^git rev-parse:/);
+  assert.equal(result.body.error.details, null);
+});
+
 test('end to end: save adapter, dispatch from stdin, status, result, deliver, rate', async () => {
   const root = tempRoot();
   const adapterFile = path.join(root, 'fake.json');
@@ -78,6 +92,23 @@ test('settings, prune, agents and data-dir', () => {
 test('the bin is executable via node and prints one JSON line', () => {
   const out = execFileSync(process.execPath, [BIN, 'data-dir'], { env: { ...process.env, PODIUM_DATA_DIR: 'X' }, encoding: 'utf8' });
   assert.equal(out.trim().split('\n').length, 1);
+});
+
+test('here and status --here run in a linked worktree answer for its main repo', () => {
+  const root = tempRoot();
+  const repo = tempRepo();
+  const session = path.join(repo, '.claude', 'worktrees', 'session');
+  execFileSync('git', ['worktree', 'add', '-q', '-b', 'session', session], { cwd: repo, stdio: 'pipe' });
+  const project = podium(root, ['here'], { cwd: repo }).body.project;
+  assert.equal(podium(root, ['here'], { cwd: session }).body.project, project);
+  const { job } = createJob(root, { project, ticket: 'NO-TICKET', agent: 'fake', permission: 'read-only', cwd: repo, prompt: 'repo job' });
+  assert.deepEqual(podium(root, ['status', '--here'], { cwd: session }).body.jobs.map((j) => j.id), [job.id]);
+  // A job this worktree started when its own folder name was its key is still listed here, and only here.
+  const { job: older } = createJob(root, { project: 'session', ticket: 'NO-TICKET', agent: 'fake', permission: 'read-only', cwd: session, prompt: 'older job', now: new Date(Date.now() + 1000) });
+  // Another repo of that name keeps its jobs: under the older key, only the ones made in this worktree count.
+  createJob(root, { project: 'session', ticket: 'NO-TICKET', agent: 'fake', permission: 'read-only', cwd: path.join(tempRoot(), 'session'), prompt: 'another repo', now: new Date(Date.now() + 2000) });
+  assert.deepEqual(podium(root, ['status', '--here'], { cwd: session }).body.jobs.map((j) => j.id), [older.id, job.id]);
+  assert.deepEqual(podium(root, ['status', '--here'], { cwd: repo }).body.jobs.map((j) => j.id), [job.id]);
 });
 
 test('status --here, summary and adapter save from stdin', async () => {
