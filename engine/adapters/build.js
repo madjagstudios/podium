@@ -5,7 +5,7 @@ import { COMMAND_NAME } from '../settings.js';
 
 const fill = (list, id) => list.map((a) => assertArg(a.split('{id}').join(id)));
 
-export function buildInvocation(adapter, { permission, model, promptFile, session = null, allow = [] }) {
+export function buildInvocation(adapter, { permission, model, promptFile, session = null, allow = [], settingsFile = null }) {
   if (!PERMISSIONS.includes(permission)) {
     throw new PodiumError('bad-permission', `Unknown permission level "${permission}". Use one of: ${PERMISSIONS.join(', ')}.`);
   }
@@ -24,15 +24,18 @@ export function buildInvocation(adapter, { permission, model, promptFile, sessio
   const allowArgs = permission === 'edit-worktree' && rules.length && names.length
     ? [assertArg(adapter.allow.flag), ...names.flatMap((cmd) => rules.map((rule) => assertArg(rule.split('{cmd}').join(cmd))))]
     : [];
+  // The adapter's own settings layer, as a file the caller wrote. Before allowArgs: --allowedTools takes every following
+  // word as a rule until the next flag.
+  const settingsArgs = adapter.settings && settingsFile ? [assertArg(adapter.settings.flag), assertArg(settingsFile)] : [];
   let args;
   if (cont?.command) {
     // A resume command replaces the base command; the prompt goes last, through stdin.
-    args = [...cont.command, ...(cont.permissions?.[permission] ?? []), ...allowArgs, ...modelArgs, ...fill(cont.tail ?? [], session.id)];
+    args = [...cont.command, ...settingsArgs, ...(cont.permissions?.[permission] ?? []), ...allowArgs, ...modelArgs, ...fill(cont.tail ?? [], session.id)];
     return { command: adapter.command, args, stdin: true };
   }
   const sessionArgs = session?.mode === 'start' && resume?.start ? fill(resume.start, session.id)
     : cont?.args ? fill(cont.args, session.id) : [];
-  args = [...adapter.baseArgs, ...sessionArgs, ...adapter.permissions[permission], ...allowArgs, ...modelArgs];
+  args = [...adapter.baseArgs, ...sessionArgs, ...settingsArgs, ...adapter.permissions[permission], ...allowArgs, ...modelArgs];
   if (adapter.promptVia === 'file') args.push(adapter.promptFileFlag, promptFile);
   else if (adapter.stdinArg) args.push(adapter.stdinArg);
   return { command: adapter.command, args, stdin: adapter.promptVia === 'stdin' };

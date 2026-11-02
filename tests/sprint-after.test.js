@@ -176,14 +176,15 @@ test('a ticket waits for its dependency\'s merge, then starts from GitHub\'s mai
   assert.equal(w.git(w.repo, 'rev-parse', 'refs/remotes/origin/main'), merged);
 });
 
-test('a ticket with no "after" still branches from the local main, even when GitHub\'s main is ahead', async () => {
+test('a ticket with no "after" branches from the commit Start checked, even when GitHub\'s main moves ahead after Start', async () => {
   const { root, w } = sprintWorld();
   scriptAgent(root, 'fa', [{ write: 'a.txt', ms: 500 }]);
   scriptAgent(root, 'fr', []);
-  const ahead = remoteAhead(w, 'theirs.txt');
   const s0 = await createSprint(root, { name: 'x', tickets: [T()] }, { cwd: w.repo });
+  const ahead = remoteAhead(w, 'theirs.txt');
   const s1 = await tick(root, s0.id, { env: w.env });
   const job = jobOf(root, s1.tickets[0].job);
+  assert.equal(job.baseCommit, s0.startedFrom.commit);
   assert.equal(job.baseCommit, w.git(w.repo, 'rev-parse', 'main'));
   assert.notEqual(job.baseCommit, ahead);
 });

@@ -4,11 +4,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Writable, Readable } from 'node:stream';
-import { draftSprint, startSprint, discardSprint, createSprint, loadSprint, saveSprint, listSprints, tick, wantsRunner, setPaused, stopTicket, sprintReport } from '../engine/sprint.js';
+import { execFileSync } from 'node:child_process';
+import { draftSprint, startSprint, discardSprint, createSprint, loadSprint, saveSprint, listSprints, tick, wantsRunner, setPaused, stopTicket, sprintReport, baseNotes } from '../engine/sprint.js';
 import { ensureSprints } from '../engine/sprint-run.js';
 import { listJobDirs } from '../engine/store.js';
 import { main } from '../engine/cli.js';
-import { scriptAgent, sprintWorld } from './helpers.js';
+import { scriptAgent, sprintWorld, tempRoot, tempRepo, PLAN } from './helpers.js';
 import { loadSettings, repoSettings, setSetting } from '../engine/settings.js';
 import { projectKey } from '../engine/paths.js';
 
@@ -290,5 +291,55 @@ test('a draft still succeeds with no merge note when GitHub cannot be asked', as
   assert.equal(made.code, 0, JSON.stringify(made.body));
   assert.ok(made.body.notes.some((n) => n.includes('`node scripts/map-check.mjs`')), JSON.stringify(made.body.notes));
   assert.ok(!made.body.notes.some((n) => /will merge by/.test(n)), JSON.stringify(made.body.notes));
+});
+
+// Commits pushed to origin from a second clone, so the world's local main trails it.
+function pushFromElsewhere(w, ...names) {
+  const other = path.join(tempRoot(), 'other');
+  w.git(path.dirname(other), 'clone', '-q', w.remote, other);
+  for (const n of names) {
+    fs.writeFileSync(path.join(other, n), `${n}\n`);
+    w.git(other, 'add', '-A');
+    w.git(other, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-q', '-m', n);
+  }
+  w.git(other, 'push', '-q', 'origin', 'main');
+}
+
+test('the draft notes a base that trails its remote, and a fetch that failed', async () => {
+  const { root, w } = world();
+  const d = await draftSprint(root, { name: 'Oct', tickets: [T()] }, { cwd: w.repo });
+  // Local main holds the plans and is ahead of origin, never behind.
+  assert.deepEqual(await baseNotes(d), []);
+  pushFromElsewhere(w, 'one.txt', 'two.txt');
+  assert.deepEqual(await baseNotes(d), ["Your local main is 2 commits behind origin/main. The sprint's copies start from the local main, so Start refuses until it is updated (for example, git pull in its checkout)."]);
+  const fetchFn = async () => { throw Object.assign(new Error('git fetch: unable to access'), { remote: 'origin' }); };
+  assert.deepEqual(await baseNotes(d, { fetchFn }), ["Podium couldn't reach origin to check that main is current (unable to access). Start checks again, and starts from the local main if it still can't."]);
+});
+
+test('the draft notes a plan written in the folder but not committed on the base', async () => {
+  const { root, w } = world();
+  fs.writeFileSync(path.join(w.repo, 'docs', 'new.md'), PLAN);
+  const short = w.git(w.repo, 'rev-parse', 'HEAD').slice(0, 7);
+  const note = (key) => `Plans not committed on main at ${short}, where the sprint's copies start: ${key} (docs/new.md). Commit them to main before Start, or Start refuses.`;
+  const d = await draftSprint(root, { name: 'Oct', tickets: [T({ plan: 'docs/new.md' }), T({ key: 'ABC-12', title: 'Payouts' })] }, { cwd: w.repo });
+  assert.deepEqual(await baseNotes(d), [note('ABC-11')]);
+  // Through the CLI too: the reply's notes carry it.
+  const made = await cli(root, ['sprint', 'draft', '--json', '-'], { stdin: JSON.stringify({ name: 'Nov', tickets: [T({ key: 'ABC-13', title: 'Export', plan: 'docs/new.md' })] }), cwd: w.repo });
+  assert.equal(made.code, 0);
+  assert.ok(made.body.notes.includes(note('ABC-13')), JSON.stringify(made.body.notes));
+});
+
+test('the draft has no base notes in a repo with no remote', async () => {
+  const root = tempRoot();
+  scriptAgent(root, 'fa', [{ write: 'a.txt' }]);
+  scriptAgent(root, 'fr', [{ say: 'VERDICT: pass' }]);
+  const repo = tempRepo();
+  const git = (...a) => execFileSync('git', a, { cwd: repo, stdio: 'pipe' });
+  fs.mkdirSync(path.join(repo, 'docs'));
+  fs.writeFileSync(path.join(repo, 'docs', 'plan.md'), PLAN);
+  git('add', '-A');
+  git('-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-q', '-m', 'plan');
+  const d = await draftSprint(root, { name: 'Oct', tickets: [T()] }, { cwd: repo });
+  assert.deepEqual(await baseNotes(d), []);
 });
 

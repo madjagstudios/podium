@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createSprint, tick, loadSprint, saveSprint, wantsRunner, RETRY_MS, MAX_WAITS } from '../engine/sprint.js';
+import { createSprint, tick, loadSprint, saveSprint, wantsRunner, RETRY_MS, MAX_WAITS, RESET_MARGIN_MS } from '../engine/sprint.js';
 import { spawnSync } from 'node:child_process';
 import { Writable } from 'node:stream';
 import { main } from '../engine/cli.js';
@@ -14,10 +14,12 @@ import { waitFor, scriptAgent, sprintWorld } from './helpers.js';
 const draft = (tickets) => ({ name: 'Test sprint', tickets });
 const T = (over = {}) => ({ key: 'ABC-11', title: 'Login form', type: 'feat', plan: 'docs/plan.md', agent: 'fa', reviewer: 'fr', ...over });
 // Tick until `until(sprint)` holds; each tick re-reads the sprint's state, as a restarted runner would.
-const run = (root, id, env, until, { now } = {}) => waitFor(async () => {
+const run = (root, id, env, until, { now, timeoutMs = 90_000 } = {}) => waitFor(async () => {
   const s = await tick(root, id, { env, now: now ? now() : Date.now() });
   return until(s) ? s : null;
-}, { timeoutMs: 90_000, intervalMs: 150 });
+}, { timeoutMs, intervalMs: 150 });
+// Runs of six or more agent steps: room for a busy machine.
+const LONG = { timeoutMs: 300_000 };
 const jobsBy = (root, role) => listJobDirs(root).map(readJob).filter((j) => j.sprint?.role === role).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
 async function cli(root, argv) {
   let out = '';
@@ -94,6 +96,91 @@ test('a second failed review parks the ticket with the findings and a message', 
   assert.equal(wantsRunner(root, s), false, 'nothing left to run until the person acts');
 });
 
+const NARROW = (what) => `${what}\nFINDINGS: high=0 medium=1 low=0 repeated=0\nVERDICT: fail`;
+// By each step's title (its own prompt's first line): a follow-up's prompt.md also quotes earlier steps.
+const exactFixes = (root, n) => jobsBy(root, 'author').filter((j) => j.title === `ABC-11 task ${n}: fix exactly what the reviewer found`);
+
+test('a narrow second failure gets one more fix round, which then passes', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ write: 'a.txt' }, { write: 'a2.txt' }, { write: 'a3.txt' }, { write: 'b.txt' }]);
+  scriptAgent(root, 'fr', [{ say: 'Broken.\nVERDICT: fail' }, { say: NARROW('Focus outline invisible on dark panel (medium).') }, { say: 'VERDICT: pass' }, { say: 'VERDICT: pass' }]);
+  const s0 = await createSprint(root, draft([T()]), { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, (x) => ['pr-open', 'parked'].includes(x.tickets[0].state), LONG);
+  assert.equal(s.tickets[0].state, 'pr-open', s.tickets[0].reason);
+  const authors = jobsBy(root, 'author');
+  assert.equal(authors.length, 4, 'task 1 author, fix, extra fix; task 2 author');
+  assert.match(promptOf(root, authors[2]), /fix exactly what the reviewer found[\s\S]*Focus outline invisible on dark panel/);
+  assert.doesNotMatch(promptOf(root, authors[1]), /fix exactly/, 'the first fix is an ordinary one');
+  const reviews = jobsBy(root, 'reviewer');
+  assert.match(promptOf(root, reviews[1]), /## The previous review found\n[^\n]*\n`{3,}\n[\s\S]*Broken\./);
+  assert.doesNotMatch(promptOf(root, reviews[0]), /## The previous review found/);
+  assert.ok(s.messages.some((m) => /ABC-11: task 1's review found a few narrow problems again; Fa gets one more fix round/.test(m.text)));
+  assert.ok(!s.messages.some((m) => /needs you/.test(m.text)), 'it never parked');
+  assert.equal(s.tickets[0].narrowFix, null, 'cleared once the task passed');
+});
+
+test('a narrow failure after the extra round parks, saying three times', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ write: 'a.txt' }, { write: 'a2.txt' }, { write: 'a3.txt' }]);
+  scriptAgent(root, 'fr', [{ say: 'Broken.\nVERDICT: fail' }, { say: NARROW('Focus outline missing.') }, { say: NARROW('Still off.') }]);
+  const s0 = await createSprint(root, draft([T()]), { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'parked', LONG);
+  const t = s.tickets[0];
+  assert.equal(t.reason, 'Review failed three times on task 1');
+  assert.match(t.findings, /Still off\.\nFINDINGS: high=0 medium=1 low=0 repeated=0$/);
+  assert.equal(t.resume, 'fix');
+  assert.equal(jobsBy(root, 'author').length, 3);
+  assert.equal(exactFixes(root, 1).length, 1);
+});
+
+for (const [what, line] of [
+  ['a high finding', 'FINDINGS: high=1 medium=0 low=0 repeated=0'],
+  ['four findings', 'FINDINGS: high=0 medium=2 low=2 repeated=0'],
+  ['a repeated finding', 'FINDINGS: high=0 medium=1 low=0 repeated=1'],
+  ['no FINDINGS line', null],
+]) {
+  test(`a second failure with ${what} parks as before`, async () => {
+    const { root, w } = sprintWorld();
+    scriptAgent(root, 'fa', [{ write: 'a.txt' }, { write: 'a2.txt' }, { write: 'a3.txt' }]);
+    scriptAgent(root, 'fr', [{ say: 'Broken.\nVERDICT: fail' }, { say: `Still broken.\n${line ? `${line}\n` : ''}VERDICT: fail` }]);
+    const s0 = await createSprint(root, draft([T()]), { cwd: w.repo });
+    const s = await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'parked');
+    assert.equal(s.tickets[0].reason, 'Review failed twice on task 1');
+    assert.equal(jobsBy(root, 'author').length, 2);
+    assert.equal(s.tickets[0].narrowFix, null);
+  });
+}
+
+test("past each task's own extra round, the sprint's extra rounds pay for more until they run out, then it parks", async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ write: 'a.txt' }, { write: 'a2.txt' }, { write: 'a3.txt' }, { write: 'a4.txt' }]);
+  scriptAgent(root, 'fr', [{ say: 'Broken.\nVERDICT: fail' }, { say: NARROW('Focus outline missing.') }, { say: NARROW('Exemption too broad.') }, { say: NARROW('Label unread.') }]);
+  const s0 = await createSprint(root, { ...draft([T()]), extraRounds: 1 }, { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'parked', LONG);
+  assert.equal(s.tickets[0].reason, 'Review failed 4 times on task 1');
+  assert.match(s.tickets[0].findings, /Label unread\./);
+  assert.equal(jobsBy(root, 'author').length, 4, 'author, fix, its own extra round, one from the sprint');
+  assert.equal(exactFixes(root, 1).length, 2);
+  assert.equal(loadSprint(root, s0.id).extraUsed, 1);
+  assert.deepEqual([s.extraRounds, s.extraUsed], [1, 1]);
+  assert.ok(s.messages.some((m) => m.text === "ABC-11: task 1's review found a few narrow problems again; Fa gets another fix round, 1 of the sprint's 1 extra rounds."));
+});
+
+test('the extra round is once per task, not once per ticket', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ write: 'a.txt' }, { write: 'a2.txt' }, { write: 'a3.txt' }, { write: 'b.txt' }, { write: 'b2.txt' }, { write: 'b3.txt' }]);
+  scriptAgent(root, 'fr', [
+    { say: 'Broken.\nVERDICT: fail' }, { say: NARROW('Focus outline missing.') }, { say: 'VERDICT: pass' },
+    { say: 'Broken too.\nVERDICT: fail' }, { say: NARROW('Exemption too broad.') }, { say: 'VERDICT: pass' },
+  ]);
+  const s0 = await createSprint(root, draft([T()]), { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, (x) => ['pr-open', 'parked'].includes(x.tickets[0].state), LONG);
+  assert.equal(s.tickets[0].state, 'pr-open', s.tickets[0].reason);
+  assert.equal(exactFixes(root, 1).length, 1);
+  assert.equal(exactFixes(root, 2).length, 1);
+  assert.ok(!s.messages.some((m) => /needs you/.test(m.text)), 'it never parked');
+});
+
 test('a reviewer with no verdict counts as a fail', async () => {
   const { root, w } = sprintWorld();
   scriptAgent(root, 'fa', [{ write: 'a.txt' }, { write: 'a2.txt' }]);
@@ -122,7 +209,8 @@ test('a usage limit waits 15 minutes, then the step runs again', async () => {
   const start = Date.now();
   const waiting = await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'waiting');
   const t = waiting.tickets[0];
-  assert.match(t.reason, /^Fa hit a usage limit; trying again at \d\d:\d\d$/);
+  // A weekday goes first when the retry falls on the next day.
+  assert.match(t.reason, /^Fa hit a usage limit; trying again at (\w{3} )?\d\d:\d\d$/);
   assert.ok(Date.parse(t.retryAt) >= start + RETRY_MS);
   assert.equal(wantsRunner(root, waiting), true);
   const still = await tick(root, s0.id, { env: w.env });
@@ -185,6 +273,85 @@ test('a usage limit that lasts hours parks the ticket after MAX_WAITS waits, and
   assert.equal(s.tickets[0].reason, 'Fa has hit a usage limit for 6 hours on task 1');
   assert.equal(s.tickets[0].waits, 0);
   assert.equal(s.tickets[0].resume, 'author');
+});
+
+test('a usage limit that names its reset waits until just after it, then the step runs again', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ err: "You've hit your session limit · resets 3am (UTC)", exit: 1 }, { write: 'a.txt' }, { write: 'b.txt' }]);
+  scriptAgent(root, 'fr', [{ say: 'VERDICT: pass' }, { say: 'VERDICT: pass' }]);
+  const s0 = await createSprint(root, draft([T()]), { cwd: w.repo });
+  const waiting = await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'waiting');
+  const t = waiting.tickets[0];
+  const resetAt = jobsBy(root, 'author')[0].limit.resetAt;
+  assert.equal(Date.parse(t.retryAt), Date.parse(resetAt) + RESET_MARGIN_MS);
+  assert.match(t.reason, /^Fa hit a usage limit; trying again at (\w{3} )?\d\d:\d\d, after it resets$/);
+  assert.equal(t.resume, 'author');
+  assert.equal(wantsRunner(root, waiting), true);
+  const still = await tick(root, s0.id, { env: w.env });
+  assert.equal(still.tickets[0].state, 'waiting', 'not before the reset');
+  const later = () => Date.parse(t.retryAt) + 1000;
+  await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'pr-open', { now: later });
+  assert.equal(jobsBy(root, 'author').length, 3);
+});
+
+for (const recorded of [true, false]) {
+  test(`a tick that runs after the reset has passed retries within minutes, not a day later${recorded ? '' : ' (no reset recorded by the runner)'}`, async () => {
+    const { root, w } = sprintWorld();
+    scriptAgent(root, 'fa', [{ err: "You've hit your session limit · resets 3am (UTC)", exit: 1 }]);
+    scriptAgent(root, 'fr', []);
+    const s0 = await createSprint(root, draft([T()]), { cwd: w.repo });
+    const started = await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'running' && x.tickets[0].phase === 'author');
+    const dir = listJobDirs(root).find((d) => d.endsWith(started.tickets[0].job));
+    const job = await waitFor(() => (readJob(dir).status === 'failed' ? readJob(dir) : null), { timeoutMs: 60_000, intervalMs: 100 });
+    const resetAt = Date.parse(job.limit.resetAt);
+    if (!recorded) updateJob(root, dir, { limit: null });
+    // The tick runs a minute after the reset, past the reset's own minute: "resets 3am" must not be read as tomorrow's.
+    const s = await tick(root, s0.id, { env: w.env, now: resetAt + 60_000 });
+    assert.equal(s.tickets[0].state, 'waiting');
+    assert.equal(Date.parse(s.tickets[0].retryAt), resetAt + RESET_MARGIN_MS);
+  });
+}
+
+test('a usage limit that resets days away parks for the person', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ err: "You've hit your usage limit. Try again in 4 days 2 hours.", exit: 1 }]);
+  scriptAgent(root, 'fr', []);
+  const s0 = await createSprint(root, draft([T()]), { cwd: w.repo });
+  const s = await run(root, s0.id, w.env, (x) => x.tickets[0].state !== 'running' && x.tickets[0].state !== 'pending');
+  assert.equal(s.tickets[0].state, 'parked');
+  assert.match(s.tickets[0].reason, /^Fa hit a usage limit that resets at .+; Retry once it has$/);
+  assert.equal(s.tickets[0].resume, 'author');
+});
+
+test('a busy service backs off 1, then 8 minutes, then RETRY_MS, and parks after MAX_WAITS waits', async () => {
+  const { root, w } = sprintWorld();
+  const busy = { err: 'Selected model is at capacity.', exit: 1 };
+  scriptAgent(root, 'fa', [{ write: 'a.txt' }]);
+  scriptAgent(root, 'fr', [busy, busy, busy, busy]);
+  const s0 = await createSprint(root, draft([T()]), { cwd: w.repo });
+  const at0 = Date.now();
+  const first = await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'waiting', { now: () => at0 });
+  assert.equal(first.tickets[0].resume, 'review');
+  assert.equal(first.tickets[0].waits, 1);
+  assert.equal(Date.parse(first.tickets[0].retryAt), at0 + 60_000);
+  assert.match(first.tickets[0].reason, /^Fr's service is busy; trying again at /);
+  // Each further failure, after `waits` waits in a row already.
+  const failAgain = async (waits) => {
+    const stored = loadSprint(root, s0.id);
+    Object.assign(stored.tickets[0], { waits, retryAt: new Date(0).toISOString() });
+    saveSprint(root, stored);
+    const at = Date.now();
+    const s = await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'parked' || (x.tickets[0].state === 'waiting' && x.tickets[0].waits === waits + 1), { now: () => at });
+    return { s, at };
+  };
+  const eighth = await failAgain(3);
+  assert.equal(Date.parse(eighth.s.tickets[0].retryAt), eighth.at + 8 * 60_000);
+  const capped = await failAgain(6);
+  assert.equal(Date.parse(capped.s.tickets[0].retryAt), capped.at + RETRY_MS);
+  const parked = (await failAgain(MAX_WAITS)).s.tickets[0];
+  assert.equal(parked.state, 'parked');
+  assert.equal(parked.reason, "Fr's service has stayed busy for hours on task 1");
+  assert.equal(parked.resume, 'review');
 });
 
 test('an unexpected error parks the ticket with a plain sentence and the first line of the detail', async () => {

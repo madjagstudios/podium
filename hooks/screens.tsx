@@ -7,7 +7,7 @@ import { LEVEL_LABEL } from './state'
 import { CLAUDE_MODELS, PERMISSION_CHOICES } from './state'
 import { readiness, removalText, agentLine, agentState, agentNeedsFix } from '../mod/view.js'
 import type { DoctorReport, RemovalPlan, WhatsNew } from '../types'
-import { organise, threads, checkRows, sprintLines, sprintStatusLine, ticketState, optionsLine, turnLabel, isOpenSprint, ticketSteps, sprintStepLine, NEEDS_YOU_STATES, AT_ONCE_DEFAULT } from '../mod/view.js'
+import { organise, threads, checkRows, sprintLines, sprintStatusLine, startedFromLine, ticketState, optionsLine, turnLabel, isOpenSprint, ticketSteps, sprintStepLine, NEEDS_YOU_STATES, AT_ONCE_DEFAULT } from '../mod/view.js'
 import { PALETTES } from './theme'
 
 import type { ChangeSet, JobDetail } from '../types'
@@ -217,6 +217,9 @@ export function boardScreen(ui: Ui, p: Palette, s: SprintSummary | undefined, bo
     <Text key="board-head" bold wrap="wrap">{`${s.name ?? s.id}${draft ? ' · draft' : ''}`}</Text>,
     <Text key="board-status" color={p.dim} wrap="wrap">{draft ? 'Nothing runs until you start it.' : sprintStatusLine(s)}</Text>,
   )
+  // The commit Start checked, which the sprint's copies start from (not sent with a sprint cut to a card).
+  const fromLine = draft ? null : startedFromLine(s)
+  if (fromLine) parts.push(<Text key="board-from" color={p.dim} wrap="wrap">{fromLine}</Text>)
   // No full check for the sprint's repo: until one is set, its PRs open without it. A finished sprint opens no more,
   // and a draft that proposes one gets it at Start.
   if (s.check === false && !s.finishedAt && !s.proposed?.check) parts.push(<Text key="board-no-check" color={p.needs.text} wrap="wrap">{NO_CHECK_LINE}</Text>)

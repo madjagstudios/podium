@@ -20,12 +20,15 @@ export function validateAdapter(a) {
   check(a.permissions && PERMISSIONS.every((p) => Array.isArray(a.permissions[p])), `permissions must list arguments for each of: ${PERMISSIONS.join(', ')}.`);
   const rulesOf = (al) => (Array.isArray(al.rules) ? al.rules : [al.rule]);
   check(!a.allow || (typeof a.allow.flag === 'string' && rulesOf(a.allow).length > 0 && rulesOf(a.allow).every((x) => typeof x === 'string' && x.includes('{cmd}'))), 'allow needs a flag and rules that each contain {cmd}.');
+  check(!a.settings || (typeof a.settings.flag === 'string' && a.settings.content && typeof a.settings.content === 'object' && !Array.isArray(a.settings.content)),
+    'settings needs a flag and a content object.');
   if (errors.length) return errors;
   const tokens = [
     a.command, ...a.baseArgs, ...PERMISSIONS.flatMap((p) => a.permissions[p]),
     ...[a.modelFlag, a.promptFileFlag, a.stdinArg].filter(Boolean),
     ...(a.versionArgs ?? []), ...(a.authCheckArgs ?? []),
     ...(a.allow ? [a.allow.flag, ...rulesOf(a.allow)] : []),
+    ...(a.settings ? [a.settings.flag] : []),
   ];
   for (const token of tokens) {
     try { assertArg(token); } catch (e) { errors.push(e.message); }

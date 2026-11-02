@@ -164,6 +164,20 @@ test('sprint note takes its text on stdin and says when a step is running; sprin
   assert.equal(retried.code, 0, JSON.stringify(retried.body));
   assert.deepEqual(loadSprint(root, s0.id).tickets[0].notes.map((x) => x.text), [NOTE, 'Second.', 'Third.']);
   assert.equal(loadSprint(root, s0.id).tickets[0].state, 'waiting');
+  // The reply says whether the retry carried a note, and which one.
+  const third = loadSprint(root, s0.id).tickets[0].notes.at(-1);
+  assert.deepEqual(retried.body.retried, { key: 'ABC-11', note: { n: third.n, chars: 6 } });
+  const park = () => { const s = loadSprint(root, s0.id); Object.assign(s.tickets[0], { state: 'parked', resume: 'author' }); saveSprint(root, s); };
+  park();
+  const bare = await cli(root, ['sprint', 'retry', '--id', s0.id, '--ticket', 'ABC-11']);
+  assert.equal(bare.code, 0, JSON.stringify(bare.body));
+  assert.deepEqual(bare.body.retried, { key: 'ABC-11', note: null });
+  assert.equal(loadSprint(root, s0.id).tickets[0].notes.length, 3, 'a retry without a note adds none');
+  park();
+  const blank = await cli(root, ['sprint', 'retry', '--id', s0.id, '--ticket', 'ABC-11', '--note', '-'], { stdin: '   ' });
+  assert.equal(blank.code, 0, JSON.stringify(blank.body));
+  assert.equal(blank.body.retried.note, null);
+  assert.equal(loadSprint(root, s0.id).tickets[0].notes.length, 3);
   const empty = await cli(root, ['sprint', 'note', '--id', s0.id, '--ticket', 'ABC-11', '--text', '-'], { stdin: '' });
   assert.equal(empty.body.error.code, 'nothing-to-note');
 });

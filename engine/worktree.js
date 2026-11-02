@@ -278,14 +278,56 @@ export async function baseRef(repo, base) {
 // The base as the remote has it now ("after"): fetch it into its remote-tracking ref and return that
 // ref to start a copy from. With no remote to fetch from (baseRemote), the local base. The local branch is never
 // moved or checked out: the fetch names its target ref, whatever the remote's fetch settings are. A failed fetch
-// throws git-failed with the remote it tried as e.remote.
-export async function fetchBase(repo, base) {
+// throws git-failed with the remote it tried as e.remote. timeoutMs: the fetch's time limit (git's network limit when
+// not given).
+export async function fetchBase(repo, base, { timeoutMs } = {}) {
   const remote = await baseRemote(repo, base);
   if (!remote) return `refs/heads/${base}`;
   try {
-    await gitIn(repo, ['fetch', '-q', remote, `+refs/heads/${base}:refs/remotes/${remote}/${base}`]);
+    await gitIn(repo, ['fetch', '-q', remote, `+refs/heads/${base}:refs/remotes/${remote}/${base}`], timeoutMs ? { timeoutMs } : undefined);
   } catch (e) {
     throw Object.assign(e, { remote });
   }
   return `refs/remotes/${remote}/${base}`;
+}
+
+// How the local base stands against its remote, fetched now (fetchFn, a test seam for fetchBase): null when the base
+// is not a local branch; else { local, remote, behind, fetchError }, behind counting only the commits the local base
+// lacks. A failed fetch gives behind 0 and its reason, never a comparison with an older fetch. The local branch is
+// never moved or checked out. The fetch gets FRESHNESS_FETCH_MS (timeoutMs), well inside the time the mod gives the
+// whole draft or Start call, so a remote that hangs ends as a fetchError and Start still starts from the local base.
+export const FRESHNESS_FETCH_MS = 30_000;
+export async function baseFreshness(repo, base, { fetchFn = fetchBase, timeoutMs = FRESHNESS_FETCH_MS } = {}) {
+  const local = await resolveBase(repo, `refs/heads/${base}`);
+  if (!local) return null;
+  const remote = await baseRemote(repo, base);
+  if (!remote) return { local, remote: null, behind: 0, fetchError: null };
+  let ref;
+  try {
+    ref = await fetchFn(repo, base, { timeoutMs });
+  } catch (e) {
+    let why = String(e?.message ?? e ?? '').split(/\r?\n/)[0].replace(/^git \S+: /, '');
+    if (why.length > 160) why = `${why.slice(0, 159)}…`;
+    return { local, remote: e?.remote ?? remote, behind: 0, fetchError: why };
+  }
+  const behind = Number(await gitIn(repo, ['rev-list', '--count', `refs/heads/${base}..${ref}`]));
+  return { local, remote, behind, fetchError: null };
+}
+
+// The files (repo-relative paths, as given) that are not files in commit's tree, in the order given. Where the repo
+// ignores case (core.ignorecase, as on Windows and macOS), a path in other letters' case counts as the file, as the
+// file system that read it at draft would.
+export async function missingAt(repo, commit, files) {
+  const missing = [];
+  let caseBlind;
+  for (const f of files) {
+    const rel = path.relative(repo, path.resolve(repo, f)).split(path.sep).join('/');
+    const type = await gitIn(repo, ['cat-file', '-t', `${commit}:${rel}`]).catch(() => null);
+    if (type === 'blob') continue;
+    caseBlind ??= (await gitIn(repo, ['config', '--bool', 'core.ignorecase']).catch(() => '')) === 'true'
+      ? new Set((await gitIn(repo, ['ls-tree', '-r', '--name-only', commit])).split(/\r?\n/).map((x) => x.toLowerCase()))
+      : null;
+    if (!caseBlind?.has(rel.toLowerCase())) missing.push(f);
+  }
+  return missing;
 }

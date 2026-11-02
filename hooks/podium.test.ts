@@ -1333,6 +1333,23 @@ test('Open board shows one sprint at once on desktop, with its buttons and rows;
   expect(await look(pane, { key: 'open-board-s1' })).toBeTruthy()
 })
 
+test('a started board names the commit its copies start from; a draft board does not', async ($, on) => {
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  const from = { commit: '1ecac46aaaabbbbccccddddeeeeffff000011112', remote: 'origin', checked: true }
+  const state = { jobs: [] as Job[], calls: [] as string[][], sprints: [{ ...LIVE, base: 'main', startedFrom: from }, { ...DRAFT, base: 'main', startedFrom: from }] }
+  on('process.run', (_$, e) => fakeEngine(state)(e.argv))
+  await $.command.run({ command: 'podium', args: '' })
+  const pane = await mountPane($)
+  await settle(pane)
+  await tap(pane, { key: 'open-board-s1' })
+  expect(await look(pane, { type: 'Text', text: /^Copies start from main at 1ecac46 \(checked against origin\/main at Start\)$/ })).toBeTruthy()
+  await tap(pane, { key: 'back' })
+  await tap(pane, { key: 'open-board-s2' })
+  expect(await look(pane, { text: /^Nothing runs until you start it.$/ })).toBeTruthy()
+  expect(await look(pane, { text: /Copies start from/ })).toBeFalsy()
+  await pane.unmount()
+})
+
 // The Client draws a pressed ticket at once from the sprint it holds, so it never flashes "no longer listed".
 test('on desktop, a Your turn sprint ticket opens at once, never as "no longer listed"', async ($, on) => {
   on('ui.open', () => ({ value: { isPlaced: true } }))

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseTasks, verdictOf, isUsageLimit, ticketBranch, authorPrompt, fixPrompt, reviewerPrompt, DIFF_LIMIT, planPath, planPrompt, revisePrompt, planNews, ticketPrBody, testedLine, testsOf, testsParkReason, TESTS_LINE, checkFixPrompt, notesSection, NOTES_CHARS, hostFailure, testsAskPrompt, productionSteps, attentionText, ATTENTION_LINES, syncedPlanNews, ticketSection, SUMMARY_CHARS, pointerOnly, changesOf, CHANGES_LINE, ciSection, ciChecksOf, CI_HEADING, CI_RULE, CI_CHECKS, CI_CHECK_CHARS } from '../engine/sprint-text.js';
+import { parseTasks, verdictOf, ticketBranch, authorPrompt, fixPrompt, reviewerPrompt, DIFF_LIMIT, planPath, planPrompt, revisePrompt, planNews, planJobSummary, ticketPrBody, testedLine, testsOf, testsParkReason, TESTS_LINE, checkFixPrompt, notesSection, NOTES_CHARS, hostFailure, testsAskPrompt, productionSteps, attentionText, ATTENTION_LINES, syncedPlanNews, ticketSection, SUMMARY_CHARS, pointerOnly, changesOf, CHANGES_LINE, ciSection, ciChecksOf, CI_HEADING, CI_RULE, CI_CHECKS, CI_CHECK_CHARS, findingsOf, narrowFindings, NARROW_FINDINGS, FINDINGS_LINE } from '../engine/sprint-text.js';
 import { sprintNewsHeadline } from '../mod/view.js';
 
 const PLAN = [
@@ -91,20 +91,6 @@ test('a diff that itself holds code fences stays inside the prompt\'s fence', ()
   const echoed = `PROMPT: ${reviewerPrompt(t, task, diff, 'C:\\copy')}\nI ran out of time before I could check it.`;
   assert.equal(verdictOf(echoed).verdict, null);
   assert.equal(verdictOf(`${echoed}\nVERDICT: fail`).verdict, 'fail');
-});
-
-test('isUsageLimit spots the usual wording', () => {
-  for (const s of [
-    'You have hit your usage limit.',
-    'Rate limit reached',
-    'Error: rate limited',
-    'HTTP 429 Too Many Requests',
-    'status: 429',
-    'quota exceeded',
-    'You exceeded your current quota',
-    'out of credits',
-  ]) assert.equal(isUsageLimit(s), true, s);
-  for (const s of ['boom', 'at foo.js:429:5', 'Add rate limiting to the API']) assert.equal(isUsageLimit(s), false, s);
 });
 
 test('ticketBranch is <type>/<key>-<slug>, with feat for an odd type', () => {
@@ -832,4 +818,79 @@ test('a plan\'s news names what it left to the PR\'s CI', () => {
   assert.doesNotMatch(planNews('s1', { ...ready, ciChecks: undefined }, 'C:\\x'), /Left to the PR's CI/);
   const none = planNews('s1', { ...ready, state: 'no-tasks', proposed: [{ n: 1, title: 'Export', text: 'x' }] }, 'C:\\x');
   assert.match(none, /Left to the PR's CI/);
+});
+
+test("findingsOf reads the reviewer's severity counts", () => {
+  const want = { high: 0, medium: 2, low: 1, repeated: 0 };
+  assert.deepEqual(findingsOf('Two issues.\nFINDINGS: high=0 medium=2 low=1 repeated=0\nVERDICT: fail'), want);
+  assert.deepEqual(findingsOf('**FINDINGS:** high=0, medium=1, low=0, repeated=0\nVERDICT: fail'), { high: 0, medium: 1, low: 0, repeated: 0 });
+  assert.deepEqual(findingsOf('- FINDINGS: high = 0 medium = 2 low = 1 repeated = 0'), want);
+  assert.deepEqual(findingsOf('FINDINGS: HIGH=0 MEDIUM=2 LOW=1 REPEATED=0.'), want);
+  assert.deepEqual(findingsOf('`FINDINGS: high=0 medium=2 low=1 repeated=0`'), want);
+});
+
+test('findingsOf is null for no line, a missing or non-numeric count, a quote, or an echoed prompt', () => {
+  assert.equal(findingsOf('Looks broken.\nVERDICT: fail'), null);
+  assert.equal(findingsOf(''), null);
+  assert.equal(findingsOf(null), null);
+  assert.equal(findingsOf('FINDINGS: high=0 medium=1 low=0'), null);
+  assert.equal(findingsOf('FINDINGS: high=two medium=1 low=0 repeated=0'), null);
+  assert.equal(findingsOf('FINDINGS: high=0 medium=1 low=0 repeated=0 extra=1'), null);
+  assert.equal(findingsOf('FINDINGS: high=0 high=1 medium=1 low=0 repeated=0'), null);
+  assert.equal(findingsOf('```\nFINDINGS: high=0 medium=1 low=0 repeated=0\n```\nVERDICT: fail'), null);
+  assert.equal(findingsOf('> FINDINGS: high=0 medium=1 low=0 repeated=0\nVERDICT: fail'), null);
+  const task = { n: 1, title: 'x', text: 'Do x.' };
+  const echoed = `${reviewerPrompt({ key: 'A-1', title: 'T' }, task, 'diff', 'copy', { previous: 'FINDINGS: high=0 medium=1 low=0 repeated=0' })}\nI ran out of time.`;
+  assert.equal(findingsOf(echoed), null);
+});
+
+test('findingsOf: the last line that parses wins, and a later bad line never erases it', () => {
+  assert.deepEqual(findingsOf('FINDINGS: high=1 medium=0 low=0 repeated=0\nFINDINGS: high=0 medium=1 low=0 repeated=0'), { high: 0, medium: 1, low: 0, repeated: 0 });
+  assert.deepEqual(findingsOf('FINDINGS: high=0 medium=1 low=0 repeated=0\nFINDINGS: high=<n> medium=<n> low=<n> repeated=<n>'), { high: 0, medium: 1, low: 0, repeated: 0 });
+});
+
+test('narrowFindings: nothing high, one to three findings, none repeated', () => {
+  const c = (high, medium, low, repeated) => ({ high, medium, low, repeated });
+  assert.equal(NARROW_FINDINGS, 3);
+  for (const x of [c(0, 2, 0, 0), c(0, 0, 1, 0), c(0, 1, 2, 0)]) assert.equal(narrowFindings(x), true, JSON.stringify(x));
+  for (const x of [null, c(1, 0, 0, 0), c(0, 0, 0, 0), c(0, 3, 1, 0), c(0, 1, 0, 1)]) assert.equal(narrowFindings(x), false, JSON.stringify(x));
+});
+
+test('reviewerPrompt asks for the FINDINGS line and quotes a previous review only when given', () => {
+  const t = { key: 'ABC-11', title: 'Login form' };
+  const task = { n: 2, title: 'Add b.txt', text: 'Write b.' };
+  const plain = reviewerPrompt(t, task, 'the diff', 'copy');
+  assert.ok(plain.includes(FINDINGS_LINE));
+  assert.ok(plain.indexOf(FINDINGS_LINE) < plain.indexOf('End your answer with the verdict'));
+  assert.ok(plain.includes('Low findings alone, or an edge case that is very unlikely in real use, are not a reason to fail: list them and pass.'));
+  assert.ok(plain.indexOf('Say pass only if nothing needs fixing') < plain.indexOf('Severity: high is wrong'));
+  assert.doesNotMatch(plain, /## The previous review found/);
+  assert.doesNotMatch(reviewerPrompt(t, task, 'the diff', 'copy', { previous: '  ' }), /## The previous review found/);
+  const fix = reviewerPrompt(t, task, 'the diff', 'copy', { previous: 'Focus outline missing.' });
+  assert.match(fix, /## The previous review found\nThis review checks a fix for these findings\.[^\n]*\n```\nFocus outline missing\.\n```\n\n## The writer reported/);
+  const long = reviewerPrompt(t, task, 'd', 'c', { previous: `start${'x'.repeat(5000)}end` });
+  assert.doesNotMatch(long, /startx/);
+  assert.match(long, /x{100}end\n```/);
+});
+
+test('fixPrompt with exact asks to fix exactly the quoted findings; without it, nothing changes', () => {
+  const t = { key: 'ABC-11', title: 'Login form' };
+  const task = { n: 2, title: 'Add b.txt', text: 'Write b.' };
+  const exact = fixPrompt(t, task, 'Focus outline missing.', { exact: true });
+  assert.match(exact, /^ABC-11 task 2: fix exactly what the reviewer found\n/);
+  assert.ok(exact.includes('Fix exactly these, and nothing else'));
+  assert.match(exact, /## The reviewer said\n```\nFocus outline missing\.\n```\n/);
+  assert.ok(exact.endsWith(`${DOTNET_INSTRUCTION}\n\n${TESTS_LINE}`));
+  assert.equal(fixPrompt(t, task, 'x'), fixPrompt(t, task, 'x', { exact: false }));
+  assert.match(fixPrompt(t, task, 'x'), /^ABC-11 task 2: fix what the reviewer found\n/);
+  assert.equal(testsOf(`${exact}\nI ran out of time.`).result, null);
+});
+
+test('a planning job\'s summary names the plan and its tasks', () => {
+  const t = { plan: 'docs/plans/x.md', state: 'plan-ready', proposed: [{ n: 1, title: 'Add it' }, { n: 2, title: 'Test it' }] };
+  assert.equal(planJobSummary(t), 'Plan: docs/plans/x.md\n2 tasks:\n1. Add it\n2. Test it');
+  assert.equal(planJobSummary({ ...t, proposed: [{ n: 1, title: 'Add it' }] }), 'Plan: docs/plans/x.md\n1 task:\n1. Add it');
+  const many = planJobSummary({ ...t, proposed: Array.from({ length: 12 }, (_, i) => ({ n: i + 1, title: `T${i + 1}` })) }).split('\n');
+  assert.deepEqual(many.slice(2), [...Array.from({ length: 10 }, (_, i) => `${i + 1}. T${i + 1}`), 'and 2 more']);
+  assert.equal(planJobSummary({ ...t, state: 'no-tasks' }), 'Plan: docs/plans/x.md\nPodium couldn\'t find "### Task N:" headings in it.');
 });

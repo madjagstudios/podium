@@ -2,6 +2,17 @@
 
 Each section is what Podium shows under "What's new" after an update.
 
+## 0.6.0
+
+- Claude jobs that Podium starts no longer run your own hooks, so a hook meant for your interactive sessions (an end-of-session reminder, say) can't take over a writer's answer and stop a task that passed.
+- A planning job's summary names the plan it wrote and lists its tasks.
+- Retry keeps your note however it's sent, and its reply says whether a note went with it. Podium's tools name any field they ignored.
+- When a step hits an agent's usage limit, Podium waits and then carries on by itself. If the message gives a reset time Podium recognizes, it waits until just after that time. Otherwise it tries again every 15 minutes, and after about 6 hours the ticket stops for you. If the reset is more than a day away, the ticket stops and shows when the limit resets.
+- When an agent's service is busy or overloaded, the step is tried again after a short wait that grows each time, up to 15 minutes.
+- Drafting a sprint and pressing Start both check that your local base has its remote's latest commits and the sprint's plans. Start won't go ahead until it does. If the remote can't be reached, Start warns and uses your local base. Tickets that don't wait on another ticket start from the commit Start checked, and the board shows that commit.
+- A task whose review fails again with only a few Medium or Low findings, none repeated, gets one more fix round, aimed at exactly those findings, before Podium asks you. Reviewers count their findings by severity and don't fail work over minor polish.
+- A sprint can have a budget of extra fix rounds for such findings (set when you draft it), so an unattended run can keep going. The board shows how much of it is used.
+
 ## 0.5.0
 
 - Writers and reviewers see the ticket's own text, not just its key, so agents that can't open your tracker still know what to build. A draft warns when a ticket only points at the tracker.

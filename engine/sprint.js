@@ -18,9 +18,10 @@ import { loadAdapters } from './adapters/registry.js';
 import { findJobDir, listJobDirs, readJob, updateJob } from './store.js';
 import { dispatch } from './dispatch.js';
 import { threadOf, openPr, setAutoMerge, ciVerdict } from './pr.js';
-import { repoRoot, resolveBase, gitIn, removeWorktree, fetchBase, baseRef } from './worktree.js';
+import { repoRoot, resolveBase, gitIn, removeWorktree, fetchBase, baseRef, baseFreshness, missingAt } from './worktree.js';
 import { readOutput } from './retention.js';
-import { parseTasks, unfenced, verdictOf, isUsageLimit, ticketBranch, authorPrompt, fixPrompt, reviewerPrompt, testsAskPrompt, planPath, planPrompt, revisePrompt, planNews, ticketPrBody, testedLine, testsOf, testsParkReason, REPORT_CHARS, checkFixPrompt, productionSteps, attentionText, syncedPlanNews, ATTENTION_LINES, pointerOnly, changesOf, ciChecksOf } from './sprint-text.js';
+import { agentLimit } from './limits.js';
+import { parseTasks, unfenced, verdictOf, ticketBranch, authorPrompt, fixPrompt, reviewerPrompt, testsAskPrompt, planPath, planPrompt, revisePrompt, planNews, planJobSummary, ticketPrBody, testedLine, testsOf, testsParkReason, REPORT_CHARS, checkFixPrompt, productionSteps, attentionText, syncedPlanNews, ATTENTION_LINES, pointerOnly, changesOf, ciChecksOf, findingsOf, narrowFindings } from './sprint-text.js';
 import { startCheck as spawnCheck, checkState, checkSettled, stopCheck, checkCommand } from './check.js';
 import { safeArgText } from './launch.js';
 import { ghJson } from './gh.js';
@@ -383,7 +384,7 @@ function freshTicket(fields) {
   return {
     ...fields,
     state: 'pending', task: 0, phase: null, job: null, thread: null, latest: null, start: null, startFor: null,
-    fails: 0, retries: 0, reviews: 0, rounds: 0, trying: null, resume: null, reason: null, findings: null, retryAt: null, dispatching: null,
+    fails: 0, retries: 0, narrowFix: null, reviews: 0, rounds: 0, trying: null, resume: null, reason: null, findings: null, retryAt: null, dispatching: null,
     pr: null, startedAt: null, endedAt: null,
   };
 }
@@ -458,6 +459,28 @@ export function draftNotes(sprint, settings = null) {
   return notes;
 }
 
+// What the draft's reply says about the base its copies start from: fetched now, it may trail its remote, and a ticket's
+// plan may not be committed on it (the plan was read from the caller's folder). Start checks both again and refuses.
+export async function baseNotes(sprint, { fetchFn } = {}) {
+  const fresh = await baseFreshness(sprint.repo, sprint.base, fetchFn ? { fetchFn } : {});
+  if (!fresh) return [];
+  const b = sprint.base;
+  const notes = [];
+  if (fresh.behind > 0) {
+    notes.push(`Your local ${b} is ${fresh.behind} commit${fresh.behind === 1 ? '' : 's'} behind ${fresh.remote}/${b}. The sprint's copies start from the local ${b}, so Start refuses until it is updated (for example, git pull in its checkout).`);
+  }
+  if (fresh.fetchError) {
+    notes.push(`Podium couldn't reach ${fresh.remote} to check that ${b} is current (${fresh.fetchError}). Start checks again, and starts from the local ${b} if it still can't.`);
+  }
+  const planned = sprint.tickets.filter((t) => t.plan && t.tasks.length > 0);
+  const missing = new Set(await missingAt(sprint.repo, fresh.local, planned.map((t) => t.plan)));
+  const lacking = planned.filter((t) => missing.has(t.plan));
+  if (lacking.length) {
+    notes.push(`Plans not committed on ${b} at ${fresh.local.slice(0, 7)}, where the sprint's copies start: ${lacking.map((t) => `${t.key} (${t.plan})`).join(', ')}. Commit them to ${b} before Start, or Start refuses.`);
+  }
+  return notes;
+}
+
 // Command-line tools that can deploy, publish or delete beyond the repo.
 const DEPLOY_TOOLS = new Set(['supabase', 'vercel', 'gh', 'npx', 'fly', 'flyctl', 'firebase', 'terraform', 'kubectl', 'aws', 'gcloud', 'az', 'heroku', 'netlify', 'wrangler', 'docker']);
 
@@ -470,6 +493,7 @@ export async function draftSprint(root, draft, { cwd, session = null, now = new 
   // The repo's commands, full check and plans folder, checked before anything is saved. Claude proposes them; the
   // person confirms: they stay on the draft (proposed, shown on its board) and are saved for the repo only at Start.
   const repoValues = repoInput(draft);
+  const extraRounds = extraRoundsOf(draft.extraRounds);
   const repo = await repoRoot(cwd).catch(() => null);
   if (!repo) throw new PodiumError('not-a-git-repo', 'A sprint runs in a git repo, but this folder is not in one.');
   const base = draft.base || 'main';
@@ -522,7 +546,7 @@ export async function draftSprint(root, draft, { cwd, session = null, now = new 
   await branchesFree(repo, built);
   const sprint = {
     id: newJobId(now), name: String(draft.name ?? 'Sprint'), project: projectKey(cwd), repo, base, session,
-    maxParallel: Number(loadSettings(root).sprintParallel) || 3, autoMerge: draft.mergeWhenGreen === true, paused: false,
+    maxParallel: Number(loadSettings(root).sprintParallel) || 3, autoMerge: draft.mergeWhenGreen === true, extraRounds, extraUsed: 0, paused: false,
     draft: true, createdAt: now.toISOString(), startedAt: null, finishedAt: null, tickets: built, messages: [],
     proposed: Object.keys(repoValues).length ? repoValues : null,
   };
@@ -541,7 +565,7 @@ function draftOnly(s) {
 
 // Start a draft: check again what may have changed since it was drafted (a branch made, an agent
 // removed, a writer changed on the board), then let the runner take it.
-export function startSprint(root, id, { now = new Date() } = {}) {
+export function startSprint(root, id, { now = new Date(), fetchFn } = {}) {
   return change(root, id, async (s) => {
     if (s.discardedAt) throw discarded();
     if (!s.draft) throw new PodiumError('already-started', 'This sprint has already started.');
@@ -560,6 +584,23 @@ export function startSprint(root, id, { now = new Date() } = {}) {
       }
     }
     await branchesFree(s.repo, s.tickets);
+    // The base, fetched now: a local base that trails its remote, or lacks a ticket's plan, would give the copies stale
+    // code. A remote that can't be reached never refuses Start. Every ticket without "after" starts from the commit
+    // checked here (startedFrom).
+    const fresh = await baseFreshness(s.repo, s.base, fetchFn ? { fetchFn } : {});
+    if (fresh) {
+      const b = s.base;
+      if (fresh.behind > 0) {
+        throw new PodiumError('base-behind', `Your local ${b} is ${fresh.behind} commit${fresh.behind === 1 ? '' : 's'} behind ${fresh.remote}/${b}, so the sprint's copies would start without them. Update ${b} (for example, git pull in its checkout) and press Start again.`);
+      }
+      const planned = s.tickets.filter((t) => t.plan && t.tasks.length > 0);
+      const missing = new Set(await missingAt(s.repo, fresh.local, planned.map((t) => t.plan)));
+      const lacking = planned.filter((t) => missing.has(t.plan));
+      if (lacking.length) {
+        throw new PodiumError('plan-not-at-base', `Plans not in ${b} at ${fresh.local.slice(0, 7)}, the commit the sprint's copies start from: ${lacking.map((t) => `${t.key} (${t.plan})`).join(', ')}. Commit them to ${b} and press Start again.`);
+      }
+      s.startedFrom = { commit: fresh.local, remote: fresh.remote, checked: !fresh.fetchError && Boolean(fresh.remote), ...(fresh.fetchError ? { fetchError: fresh.fetchError } : {}) };
+    }
     // The commands, check and plans folder proposed with the draft are saved for the repo now, before anything runs;
     // the sprint keeps what was saved (applied) so the reply can say so. (Should this save of the sprint then fail, Start
     // pressed again saves the same values.)
@@ -582,7 +623,7 @@ export function discardSprint(root, id, { now = new Date() } = {}) {
 // A sprint drafted and started at once. Only tests use it: the tool and the pane always draft first.
 export async function createSprint(root, input, opts = {}) {
   const d = await draftSprint(root, input, opts);
-  return startSprint(root, d.id, { now: opts.now });
+  return startSprint(root, d.id, { now: opts.now, fetchFn: opts.fetchFn });
 }
 
 const REVIEWING = new Set(['review', 'fix-review']);
@@ -647,6 +688,10 @@ export function sprintSummary(root, s) {
   return {
     id: s.id, name: s.name, draft: Boolean(s.draft), discarded: Boolean(s.discardedAt), paused: s.paused, finishedAt: s.finishedAt, autoMerge: s.autoMerge,
     maxParallel: s.maxParallel, base: s.base,
+    // The sprint's extra fix rounds for narrow findings and how many it has spent (advance), when it has any.
+    ...(s.extraRounds ? { extraRounds: s.extraRounds, extraUsed: s.extraUsed ?? 0 } : {}),
+    // The commit Start checked, which every ticket without "after" starts from.
+    ...(s.startedFrom ? { startedFrom: { commit: s.startedFrom.commit, remote: s.startedFrom.remote ?? null, checked: Boolean(s.startedFrom.checked) } } : {}),
     // Whether the repo has a full check: without one the board warns that PRs open without it.
     check: Boolean(repoSettings(loadSettings(root), s.project).check),
     // The sprint's own chat: only it is told the sprint's news, so another chat's board says news waits for it.
@@ -808,6 +853,12 @@ export function sprintSummaries(root, { project, includeArchived = false, id = n
 export const RETRY_MS = 15 * 60_000;
 // Consecutive 15-minute waits on one step before asking the person: 24 x 15 min is about 6 hours.
 export const MAX_WAITS = 24;
+// A usage limit's reset is waited for this much longer, so the retry lands after it.
+export const RESET_MARGIN_MS = 2 * 60_000;
+// A reset further away than this parks for the person instead.
+export const MAX_RESET_WAIT_MS = 24 * 60 * 60_000;
+// A busy service's first wait, doubled on each wait in a row up to RETRY_MS.
+export const BUSY_FIRST_MS = 60_000;
 const ACTIVE = new Set(['running', 'waiting']);
 const RUNNING = new Set(['running']);
 // The tickets other than t that hold a slot: those in one of these states, and any with a step being
@@ -816,7 +867,12 @@ const holding = (sprint, t, states) => sprint.tickets.filter((x) => x !== t && (
 const label = (name) => name.charAt(0).toUpperCase() + name.slice(1);
 // Reconciled, as the job list sees it: a step whose runner died reads as lost, so the ticket parks.
 const jobOf = (root, id) => reconcile(root, findJobDir(root, id));
-const clockAt = (ms) => new Date(ms).toTimeString().slice(0, 5);
+// HH:MM in local time, with the short weekday first when it is not today.
+const whenAt = (ms, now) => {
+  const d = new Date(ms);
+  const clock = d.toTimeString().slice(0, 5);
+  return d.toDateString() === new Date(now).toDateString() ? clock : `${d.toDateString().slice(0, 3)} ${clock}`;
+};
 
 function say(sprint, text, now) {
   sprint.messages.push({ id: String(sprint.messages.length + 1), at: new Date(now).toISOString(), text, delivered: false, claimedAt: null });
@@ -899,7 +955,8 @@ function adoptDispatched(root, sprint, t) {
   return true;
 }
 
-// Where a ticket's copy starts. A ticket with no "after" branches from the local base. One that waited
+// Where a ticket's copy starts. A ticket with no "after" branches from the commit Start checked (startedFrom), or from
+// the local base for a sprint started before Start recorded one. One that waited
 // for others starts from the base as the remote has it now, with their merged work: Podium fetches it and
 // branches from <remote>/<base>, never moving or checking out the local branch. Its PR still targets the base.
 // A fetch that fails says so in Podium's words, whatever the step (it parks as is), with git's reason, cut short, last.
@@ -909,7 +966,7 @@ function adoptDispatched(root, sprint, t) {
 // commit is known (a PR refresh records it), the fetch must hold it: GitHub can call a PR merged before a fetch sees its
 // commit. { wait: true } when it does not: the ticket stays as it is and starts on a later tick, from a later fetch.
 async function startFrom(root, sprint, t, opts) {
-  if (!(t.after ?? []).length) return { base: sprint.base };
+  if (!(t.after ?? []).length) return sprint.startedFrom?.commit ? { base: sprint.base, from: sprint.startedFrom.commit } : { base: sprint.base };
   let from;
   try {
     opts.fetched ??= (opts.fetchFn ?? fetchBase)(sprint.repo, sprint.base);
@@ -1005,7 +1062,10 @@ async function startFix(root, sprint, t, opts) {
   // They go back into findings before the step starts, so a later park, wait or restart of this fix still has them.
   const said = t.reviewSaid ?? t.findings;
   Object.assign(t, { findings: said, reviewSaid: null });
-  const res = await dispatchStep(root, t, 'fix', opts, { agent: task.agent, ticket: t.key, cwd: sprint.repo, project: sprint.project, session: sprint.session, env, prompt: fixPrompt(t, task, said), followUp: t.latest, meta: meta(sprint, t, 'author') });
+  // The task's extra round for a few narrow findings (advance) is told to fix exactly those: read from the ticket, so a
+  // wait or restart of that round keeps it. A Retry sets fails back to 1, and its fix is an ordinary one.
+  const exact = t.narrowFix === t.task && t.fails > 1;
+  const res = await dispatchStep(root, t, 'fix', opts, { agent: task.agent, ticket: t.key, cwd: sprint.repo, project: sprint.project, session: sprint.session, env, prompt: fixPrompt(t, task, said, { exact }), followUp: t.latest, meta: meta(sprint, t, 'author') });
   started(t, 'fix', res.job);
 }
 
@@ -1075,8 +1135,10 @@ async function startReview(root, sprint, t, phase, opts) {
     if (saved || aside || stopped) say(sprint, `${t.key}: before its review ran again,${saved ? ` changes left in its copy were saved as a git stash ("${saved}").` : ''}${asideNote(t, aside, stopped)}`, opts.now);
   }
   t.trying = phase;
-  // A fix's reviewer findings kept aside (reviewSaid) are done with: this review says what is wrong now.
-  t.reviewSaid = null;
+  // A fix's reviewer sees the findings that fix was for, so it can count the ones still there (repeated). A fix that parked
+  // on its tests holds the writer's report in findings and the reviewer's in reviewSaid: the reviewer's are the ones. They
+  // stay kept until a review is read (advance), so a review that fails to finish and runs again quotes them too.
+  const previous = phase === 'fix-review' ? t.reviewSaid ?? t.findings : null;
   const task = t.tasks[t.task];
   const { copy, head } = await checkpointWork(root, t, reviewCommit(t, task, phase));
   const diff = await gitIn(copy, ['diff', t.start, head]);
@@ -1093,7 +1155,7 @@ async function startReview(root, sprint, t, phase, opts) {
   t.reviewBranch = await gitIn(copy, ['rev-parse', '--abbrev-ref', 'HEAD']);
   const res = await dispatchStep(root, t, phase, opts, {
     agent: task.reviewer, permission: 'edit-worktree', ticket: t.key, cwd: sprint.repo, project: sprint.project, session: sprint.session, env,
-    prompt: reviewerPrompt(t, task, diff, copy, { ...writerReport(root, t), host: passed, preexisting, accepted: said('accept'), evidence: said('evidence') }),
+    prompt: reviewerPrompt(t, task, diff, copy, { ...writerReport(root, t), host: passed, preexisting, accepted: said('accept'), evidence: said('evidence'), previous }),
     meta: meta(sprint, t, 'reviewer'), inCopy: { worktree: copy, repoRoot: jobOf(root, t.latest).repoRoot ?? sprint.repo },
   });
   // Its job, whose temp folder afterReview removes.
@@ -1198,6 +1260,8 @@ async function planReady(root, sprint, t, opts) {
   const asked = t.phase === 'revise' ? t.asked : null;
   Object.assign(t, { phase: null, job: null, trying: null, resume: null, waits: 0, asked: null, planExtra: null });
   propose(root, sprint, t, text);
+  // The planning job reads as what it made, whatever the agent's own last reply was.
+  fs.writeFileSync(path.join(findJobDir(root, job.id), 'summary.md'), `${planJobSummary(t)}\n`);
   say(sprint, planNews(sprint.id, t, where, { asked }), now);
 }
 
@@ -1894,7 +1958,6 @@ async function advance(root, sprint, t, opts) {
   const dir = findJobDir(root, job.id);
   // The step's answer, read once: its tests line, its verdict, and (with stderr) a usage limit are read from it.
   const output = readOutput(dir) ?? '';
-  const said = `${output}\n${tail(dir, 'stderr.log')}`;
   if (['failed', 'lost', 'cancelled'].includes(job.status)) {
     t.trying = t.phase;
     // Waited for as long as Podium waits, its agent's process is alive still: only the person may go on (a usage limit's
@@ -1902,12 +1965,36 @@ async function advance(root, sprint, t, opts) {
     if (agentAlive(job)) {
       return park(sprint, t, `${label(job.agent)} stopped on ${what}: ${job.error ?? job.status} Its agent (process ${job.agentPid}) was still running after ${AGENT_WAIT_MS / 3_600_000} hours. Retry works in the same copy, so end that process first if it is still ${label(job.agent)}'s.`, now);
     }
-    if (isUsageLimit(said)) {
+    // An account's usage limit waits for its reset (or retries every RETRY_MS when it names none); a busy service backs off.
+    // "resets 3am" means the 3am after the step ended, not after this tick (a tick may run after the reset has passed):
+    // the runner's recorded reset first, else the text read against the job's end.
+    const ended = Date.parse(job.endedAt);
+    const found = agentLimit([output, tail(dir, 'stderr.log')], Number.isFinite(ended) ? Math.min(ended, now) : now);
+    const recorded = Date.parse(job.limit?.resetAt);
+    const limit = found?.kind === 'usage' && Number.isFinite(recorded) ? { ...found, resetAt: recorded } : found;
+    if (limit) {
+      const who = label(job.agent);
+      const waits = t.waits ?? 0;
       // A wrong match must not wait forever: after about six hours of waits on one step, ask the person.
-      if ((t.waits ?? 0) >= MAX_WAITS) return park(sprint, t, `${label(job.agent)} has hit a usage limit for 6 hours on ${what}`, now);
-      t.waits = (t.waits ?? 0) + 1;
-      const at = now + RETRY_MS;
-      Object.assign(t, { state: 'waiting', resume: t.phase, job: null, retryAt: new Date(at).toISOString(), reason: `${label(job.agent)} hit a usage limit; trying again at ${clockAt(at)}` });
+      if (waits >= MAX_WAITS) {
+        return park(sprint, t, limit.kind === 'usage' ? `${who} has hit a usage limit for 6 hours on ${what}` : `${who}'s service has stayed busy for hours on ${what}`, now);
+      }
+      let at;
+      let reason;
+      if (limit.kind === 'busy') {
+        at = now + Math.min(BUSY_FIRST_MS * 2 ** waits, RETRY_MS);
+        reason = `${who}'s service is busy; trying again at ${whenAt(at, now)}`;
+      } else if (limit.resetAt) {
+        at = Math.max(limit.resetAt + RESET_MARGIN_MS, now + 60_000);
+        // Days away (a weekly limit): the person decides whether the sprint waits that long.
+        if (at - now > MAX_RESET_WAIT_MS) return park(sprint, t, `${who} hit a usage limit that resets at ${whenAt(limit.resetAt, now)}; Retry once it has`, now);
+        reason = `${who} hit a usage limit; trying again at ${whenAt(at, now)}, after it resets`;
+      } else {
+        at = now + RETRY_MS;
+        reason = `${who} hit a usage limit; trying again at ${whenAt(at, now)}`;
+      }
+      t.waits = waits + 1;
+      Object.assign(t, { state: 'waiting', resume: t.phase, job: null, retryAt: new Date(at).toISOString(), reason });
       return;
     }
     return park(sprint, t, `${label(job.agent)} stopped on ${what}: ${job.error ?? job.status}`, now);
@@ -1961,10 +2048,12 @@ async function advance(root, sprint, t, opts) {
   // Cleaned: anything in the copy from now on is someone else's (Stop saves it to the branch). reviewHead stays set only
   // while a review may have left something (it failed to finish, or is running), for startReview and Stop to drop.
   t.reviewHead = null;
+  // A fix's reviewer findings kept aside (reviewSaid) are done with: this review says what is wrong now.
+  t.reviewSaid = null;
   updateJob(root, dir, { hasChanges: false, ...(job.status === 'needs-review' ? { status: 'done' } : {}) }, 'reviewed');
   const { verdict, findings } = verdictOf(output);
   if (verdict === 'pass') {
-    Object.assign(t, { reviews: t.reviews + 1, fails: 0, retries: 0, findings: null, task: t.task + 1 });
+    Object.assign(t, { reviews: t.reviews + 1, fails: 0, retries: 0, findings: null, narrowFix: null, task: t.task + 1 });
     if (t.task >= t.tasks.length) return afterLastTask(root, sprint, t, opts);
     return startAuthor(root, sprint, t, opts);
   }
@@ -1974,6 +2063,20 @@ async function advance(root, sprint, t, opts) {
   if (t.fails === 0) {
     Object.assign(t, { fails: 1, findings: why });
     return startFix(root, sprint, t, opts);
+  }
+  // A fix's review that failed again with a few narrow findings, none of them the last review's, gets one more fix round
+  // before the person is asked: once per task (narrowFix), then from the sprint's extra rounds (extraRounds, set on the
+  // draft) while any are left, so review rounds stay bounded. Only a review that counted its findings (findingsOf) qualifies.
+  if (verdict === 'fail' && t.phase === 'fix-review' && narrowFindings(findingsOf(output))) {
+    const own = t.narrowFix !== t.task;
+    const used = sprint.extraUsed ?? 0;
+    if (own || used < (sprint.extraRounds ?? 0)) {
+      Object.assign(t, { fails: t.fails + 1, findings: why, narrowFix: t.task });
+      if (!own) sprint.extraUsed = used + 1;
+      const round = own ? 'one more fix round before Podium asks you' : `another fix round, ${used + 1} of the sprint's ${sprint.extraRounds} extra rounds`;
+      say(sprint, `${t.key}: task ${task.n}'s review found a few narrow problems again; ${label(task.agent)} gets ${round}.`, now);
+      return startFix(root, sprint, t, opts);
+    }
   }
   t.trying = 'fix';
   const reviewed = t.phase;
@@ -1986,7 +2089,10 @@ async function advance(root, sprint, t, opts) {
 function parkReason(t, n, gaveVerdict) {
   const k = t.retries ?? 0;
   const after = k > 1 ? `after ${k} retries` : 'after a retry';
-  if (gaveVerdict) return k ? `Review failed again on task ${n} ${after}` : `Review failed twice on task ${n}`;
+  // Each extra round for narrow findings (advance) added a failed review before this one, the park's.
+  const failed = (t.fails ?? 1) + 1;
+  const times = failed <= 2 ? 'twice' : failed === 3 ? 'three times' : `${failed} times`;
+  if (gaveVerdict) return k ? `Review failed again on task ${n} ${after}` : `Review failed ${times} on task ${n}`;
   return k ? `The reviewer didn't give a verdict on task ${n} again ${after}` : `The reviewer didn't give a verdict on task ${n}, twice`;
 }
 
@@ -2394,7 +2500,7 @@ export function approvePlan(root, id, key, { whole = false, acknowledge = false 
     }
     t.tasks = t.proposed.map((x) => ({ n: x.n, title: x.title, text: x.text, agent: t.agent, reviewer: t.reviewer }));
     // The tasks' counts start afresh: a retry while planning is not one of task 1's (its park reason would say "after a retry").
-    Object.assign(t, { state: 'pending', proposed: null, attention: null, attentionMore: null, reason: null, task: 0, phase: null, trying: null, resume: null, retries: 0, fails: 0 });
+    Object.assign(t, { state: 'pending', proposed: null, attention: null, attentionMore: null, reason: null, task: 0, phase: null, trying: null, resume: null, retries: 0, fails: 0, narrowFix: null });
   });
 }
 
@@ -2731,11 +2837,21 @@ export function setAfter(root, id, key, { keys = null, add = null, drop = null }
   });
 }
 
-// A draft's Merge when green and how many of its tickets run at once.
-export function setSprintOptions(root, id, { mergeWhenGreen, atOnce } = {}) {
+// How many fix rounds for narrow findings a sprint may run without asking, past each task's own one (advance).
+export const MAX_EXTRA_ROUNDS = 20;
+function extraRoundsOf(value) {
+  if (value === undefined || value === null) return 0;
+  const n = typeof value === 'string' && value.trim() !== '' ? Number(value) : value;
+  if (!Number.isInteger(n) || n < 0 || n > MAX_EXTRA_ROUNDS) throw new PodiumError('bad-value', `Extra rounds must be a whole number from 0 to ${MAX_EXTRA_ROUNDS}.`);
+  return n;
+}
+
+// A draft's Merge when green, how many of its tickets run at once, and its extra rounds for narrow findings.
+export function setSprintOptions(root, id, { mergeWhenGreen, atOnce, extraRounds } = {}) {
   return change(root, id, (s) => {
     draftOnly(s);
-    if (mergeWhenGreen === undefined && atOnce === undefined) throw new PodiumError('nothing-to-change', 'Say what to change: Merge when green or At once.');
+    if (mergeWhenGreen === undefined && atOnce === undefined && extraRounds === undefined) throw new PodiumError('nothing-to-change', 'Say what to change: Merge when green, At once or Extra rounds.');
+    if (extraRounds !== undefined) s.extraRounds = extraRoundsOf(extraRounds);
     if (atOnce !== undefined) {
       const n = Number(atOnce);
       if (!Number.isInteger(n) || n < 1 || n > MAX_AT_ONCE) throw new PodiumError('bad-value', `At once must be a whole number from 1 to ${MAX_AT_ONCE}.`);

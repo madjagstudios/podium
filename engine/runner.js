@@ -15,6 +15,7 @@ import { changeSummary } from './changes.js';
 import { loadSettings, repoSettings } from './settings.js';
 import { PodiumError } from './errors.js';
 import { copyBuildEnv } from './build-env.js';
+import { agentLimit } from './limits.js';
 
 export const SANDBOX_BROKEN = /sandbox enforcement unavailable|SetNamedSecurityInfoW failed/i;
 
@@ -41,7 +42,13 @@ async function runAgent(root, job, adapter, dir, session) {
   // The repo's commands, read as the step starts, so a change in Settings reaches the next step. Only for a job
   // in Podium's copy: with worktreeForEdits off an edit job works in the person's own folder, and gets no allow rule.
   const allow = job.worktree ? repoSettings(loadSettings(root), job.project).commands : [];
-  const invocation = buildInvocation(adapter, { permission: job.permission, model: job.model, promptFile, session, allow });
+  // An adapter's own settings layer (Claude's turns the person's hooks off), written fresh each run into the job's folder.
+  let settingsFile = null;
+  if (adapter.settings?.content) {
+    settingsFile = path.join(dir, 'agent-settings.json');
+    fs.writeFileSync(settingsFile, `${JSON.stringify(adapter.settings.content, null, 2)}\n`);
+  }
+  const invocation = buildInvocation(adapter, { permission: job.permission, model: job.model, promptFile, session, allow, settingsFile });
   const line = commandLine(invocation.command, invocation.args);
   const env = { ...(job.worktree ? copyBuildEnv() : process.env), PODIUM_JOB_ID: job.id, ...tempEnv(job, dir) };
 
@@ -167,7 +174,13 @@ export async function runJob(root, dir) {
     patch.status = patch.hasChanges ? 'needs-review' : 'done';
   } else {
     patch.status = 'failed';
-    patch.error = spawnError ? `Could not start ${adapter.label}: ${spawnError}` : `${adapter.label} exited with code ${code}.`;
+    // An account's usage limit or a busy service, named with the agent's own line: otherwise only output.md says why.
+    const limit = spawnError ? null : agentLimit([tail('output.md'), tail('stderr.log')], Date.now());
+    if (spawnError) patch.error = `Could not start ${adapter.label}: ${spawnError}`;
+    else if (limit?.kind === 'usage') patch.error = `${adapter.label} hit a usage limit: ${limit.line} (exit code ${code})`;
+    else if (limit?.kind === 'busy') patch.error = `${adapter.label} couldn't get through, its service was busy: ${limit.line} (exit code ${code})`;
+    else patch.error = `${adapter.label} exited with code ${code}.`;
+    if (limit) patch.limit = { kind: limit.kind, resetAt: limit.resetAt ? new Date(limit.resetAt).toISOString() : null };
     Object.assign(patch, outcomePatch(current, 'unknown', 'auto') ?? {});
   }
   return updateJob(root, dir, patch, 'finished');

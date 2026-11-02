@@ -3,11 +3,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { isGitRepo, repoRoot, resolveBase, createWorktree, committedWork, hasLeftovers, diffWorktree, applyPatch, removeWorktree, gitIn, gitOptions, runInGroup, NETWORK_TIMEOUT_MS } from '../engine/worktree.js';
+import { isGitRepo, repoRoot, resolveBase, createWorktree, committedWork, hasLeftovers, diffWorktree, applyPatch, removeWorktree, gitIn, gitOptions, runInGroup, NETWORK_TIMEOUT_MS, baseFreshness, missingAt, FRESHNESS_FETCH_MS } from '../engine/worktree.js';
+import { callEngine } from '../mod/engine.js';
 import { pathToFileURL } from 'node:url';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { tempRoot, tempRepo, waitFor } from './helpers.js';
+import { tempRoot, tempRepo, waitFor, ghWorld } from './helpers.js';
 
 test('isGitRepo and repoRoot', async () => {
   const repo = tempRepo();
@@ -285,4 +286,95 @@ test('a grouped command that writes past maxBuffer is stopped and fails plainly;
   const ok = await runInGroup(process.execPath, ['-e', "process.stdout.write('h\u00e9llo'); process.stderr.write('w')"], { windowsHide: true }, { timeoutMs: 15_000 });
   assert.deepEqual(ok, { stdout: 'h\u00e9llo', stderr: 'w' });
   await assert.rejects(runInGroup('definitely-not-a-real-command-xyz', ['fetch'], { windowsHide: true }, { timeoutMs: 15_000 }), (e) => e.code === 'ENOENT');
+});
+
+const sh = (cwd, ...a) => execFileSync('git', a, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+// A commit in repo touching one new file.
+const commitFile = (repo, name) => {
+  fs.writeFileSync(path.join(repo, name), `${name}\n`);
+  sh(repo, 'add', '-A');
+  sh(repo, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-q', '-m', name);
+};
+// Commits pushed to origin from a second clone, so the first repo's main trails it.
+const pushFromElsewhere = (remote, ...names) => {
+  const other = path.join(tempRoot(), 'other');
+  sh(path.dirname(other), 'clone', '-q', remote, other);
+  for (const n of names) commitFile(other, n);
+  sh(other, 'push', '-q', 'origin', 'main');
+};
+
+test('baseFreshness: no remote, and a base that is not a local branch', async () => {
+  const repo = tempRepo();
+  const head = sh(repo, 'rev-parse', 'HEAD');
+  assert.deepEqual(await baseFreshness(repo, 'main'), { local: head, remote: null, behind: 0, fetchError: null });
+  assert.equal(await baseFreshness(repo, 'v1'), null);
+});
+
+test('baseFreshness: up to date, behind, and diverged against origin; the local branch never moves', async () => {
+  const w = ghWorld([]);
+  const head = sh(w.repo, 'rev-parse', 'HEAD');
+  assert.deepEqual(await baseFreshness(w.repo, 'main'), { local: head, remote: 'origin', behind: 0, fetchError: null });
+  pushFromElsewhere(w.remote, 'one.txt', 'two.txt');
+  assert.deepEqual(await baseFreshness(w.repo, 'main'), { local: head, remote: 'origin', behind: 2, fetchError: null });
+  assert.equal(sh(w.repo, 'rev-parse', 'refs/heads/main'), head);
+  // Local one ahead (its own commit), origin one further ahead: only the commits the local base lacks count.
+  sh(w.repo, 'merge', '-q', '--ff-only', 'origin/main');
+  commitFile(w.repo, 'mine.txt');
+  pushFromElsewhere(w.remote, 'three.txt');
+  const local = sh(w.repo, 'rev-parse', 'HEAD');
+  assert.deepEqual(await baseFreshness(w.repo, 'main'), { local, remote: 'origin', behind: 1, fetchError: null });
+});
+
+test('baseFreshness fetches within its own limit, well inside the time the mod gives a draft or Start call', async () => {
+  let given;
+  await callEngine(async (_argv, opts) => { given = opts.timeoutMs; return { code: 0, stdout: '{}', stderr: '' }; }, 'C:/x', ['sprint', 'start']).catch(() => {});
+  assert.equal(typeof given, 'number');
+  assert.ok(FRESHNESS_FETCH_MS * 3 <= given, `${FRESHNESS_FETCH_MS} ms is not well below the mod's ${given} ms`);
+  // The limit reaches the fetch.
+  const w = ghWorld([]);
+  let limit;
+  await baseFreshness(w.repo, 'main', { fetchFn: async (r, b, o) => { limit = o?.timeoutMs; return 'refs/remotes/origin/main'; } });
+  assert.equal(limit, FRESHNESS_FETCH_MS);
+  // A remote that never answers ends as a fetchError, not a hang. Its wording depends on the machine (a loaded one can
+  // end the helper first: "Could not read from remote repository."), so only the outcome and the time are checked.
+  sh(w.repo, 'config', 'protocol.ext.allow', 'always');
+  sh(w.repo, 'remote', 'set-url', 'origin', 'ext::node -e setTimeout(()=>{},20000)');
+  const t0 = Date.now();
+  const r = await baseFreshness(w.repo, 'main', { timeoutMs: 2000 });
+  const took = Date.now() - t0;
+  assert.equal(r.local, sh(w.repo, 'rev-parse', 'main'));
+  assert.equal(r.remote, 'origin');
+  assert.equal(r.behind, 0);
+  assert.ok(r.fetchError, 'the fetch failed');
+  assert.ok(took < 2000 + 15_000 && took < given, `gave up in ${took} ms`);
+});
+
+test('baseFreshness: a fetch that fails gives its reason and no comparison', async () => {
+  const w = ghWorld([]);
+  const head = sh(w.repo, 'rev-parse', 'HEAD');
+  const fetchFn = async () => { throw Object.assign(new Error('git fetch: could not read from remote repository'), { remote: 'origin' }); };
+  assert.deepEqual(await baseFreshness(w.repo, 'main', { fetchFn }), { local: head, remote: 'origin', behind: 0, fetchError: 'could not read from remote repository' });
+  const long = async () => { throw new Error(`git fetch: ${'x'.repeat(200)}\nsecond line`); };
+  const r = await baseFreshness(w.repo, 'main', { fetchFn: long });
+  assert.equal(r.remote, 'origin');
+  assert.equal(r.fetchError, `${'x'.repeat(159)}…`);
+});
+
+test('missingAt lists the paths a commit lacks, in order', async () => {
+  const repo = tempRepo();
+  sh(repo, 'config', 'core.autocrlf', 'false');
+  fs.mkdirSync(path.join(repo, 'docs'));
+  commitFile(repo, path.join('docs', 'plan.md'));
+  const head = sh(repo, 'rev-parse', 'HEAD');
+  fs.writeFileSync(path.join(repo, 'docs', 'new.md'), 'new\n');
+  assert.deepEqual(await missingAt(repo, head, ['docs/new.md', 'docs/plan.md', 'docs/none.md']), ['docs/new.md', 'docs/none.md']);
+  // A folder is not a file.
+  assert.deepEqual(await missingAt(repo, head, ['docs']), ['docs']);
+  if (process.platform === 'win32') assert.deepEqual(await missingAt(repo, head, ['docs\\plan.md']), []);
+  // Where the repo ignores case, other letters' case is the same file; where it doesn't, it is missing.
+  sh(repo, 'config', 'core.ignorecase', 'true');
+  assert.deepEqual(await missingAt(repo, head, ['DOCS/Plan.MD', 'docs/none.md']), ['docs/none.md']);
+  sh(repo, 'config', 'core.ignorecase', 'false');
+  assert.deepEqual(await missingAt(repo, head, ['DOCS/Plan.MD']), ['DOCS/Plan.MD']);
+  assert.deepEqual(await missingAt(repo, head, []), []);
 });

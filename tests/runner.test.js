@@ -134,6 +134,23 @@ test('a successful job streams output and finishes done', async () => {
   assert.match(out, /ARGS: --ro/);
 });
 
+test('an adapter\'s settings layer is written into the job folder and passed to the agent', async () => {
+  const { root, dir } = setup('ok', { settings: { flag: '--settings', content: { disableAllHooks: true } } });
+  const job = await runJob(root, dir);
+  assert.equal(job.status, 'done');
+  const file = path.join(dir, 'agent-settings.json');
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { disableAllHooks: true });
+  const args = fs.readFileSync(path.join(dir, 'output.md'), 'utf8').match(/^ARGS: (.*)$/m)[1];
+  assert.ok(args.includes(`--settings ${file}`), args);
+});
+
+test('an adapter without a settings layer gets no settings file or flag', async () => {
+  const { root, dir } = setup('ok');
+  await runJob(root, dir);
+  assert.equal(fs.existsSync(path.join(dir, 'agent-settings.json')), false);
+  assert.doesNotMatch(fs.readFileSync(path.join(dir, 'output.md'), 'utf8').match(/^ARGS: (.*)$/m)[1], /--settings/);
+});
+
 test('a summary section becomes summary.md', async () => {
   const { root, dir } = setup('summary');
   await runJob(root, dir);
@@ -154,6 +171,32 @@ test('a failing agent marks the job failed with an unknown outcome', async () =>
   assert.equal(job.outcome, 'unknown');
   assert.match(job.error, /Fake exited with code 3/);
   assert.match(fs.readFileSync(path.join(dir, 'stderr.log'), 'utf8'), /boom/);
+  assert.equal('limit' in job, false, 'boom is not a limit');
+});
+
+test('an agent that stops on a usage limit says so, with when it resets', async () => {
+  const { root, dir } = setup('ok');
+  scriptAgent(root, 'fake', [{ err: "You've hit your session limit · resets 3am (UTC)", exit: 1 }]);
+  const before = Date.now();
+  const job = await runJob(root, dir);
+  assert.equal(job.status, 'failed');
+  assert.equal(job.outcome, 'unknown');
+  assert.equal(job.error, "Fake hit a usage limit: You've hit your session limit · resets 3am (UTC) (exit code 1)");
+  assert.equal(job.limit.kind, 'usage');
+  const at = new Date(job.limit.resetAt);
+  assert.equal(job.limit.resetAt, at.toISOString());
+  assert.ok(at.getTime() >= before - 60_000 && at.getTime() <= Date.now() + 24 * 3_600_000, job.limit.resetAt);
+  assert.equal(at.getUTCHours(), 3);
+  assert.equal(at.getUTCMinutes(), 0);
+});
+
+test('an agent that stops on a busy service says so', async () => {
+  const { root, dir } = setup('ok');
+  scriptAgent(root, 'fake', [{ err: 'Selected model is at capacity. Please try a different model.', exit: 1 }]);
+  const job = await runJob(root, dir);
+  assert.equal(job.status, 'failed');
+  assert.equal(job.error, "Fake couldn't get through, its service was busy: Selected model is at capacity. Please try a different model. (exit code 1)");
+  assert.deepEqual(job.limit, { kind: 'busy', resetAt: null });
 });
 
 test('an edit job in a worktree produces a patch and needs review', async () => {

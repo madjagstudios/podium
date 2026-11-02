@@ -932,7 +932,8 @@ export function whoLine(t) {
   return writers[0] === reviewers[0] ? `${named(writers[0])} writes and reviews` : `${named(writers[0])} writes, ${named(reviewers[0])} reviews`;
 }
 
-export const optionsLine = (s) => `${s.maxParallel ?? AT_ONCE_DEFAULT} at once${s.autoMerge ? ' · merge when green' : ''}`;
+const extraWords = (s) => (s.extraRounds ? ` · ${s.extraRounds} extra round${s.extraRounds === 1 ? '' : 's'}${s.extraUsed ? ` (${s.extraUsed} used)` : ''}` : '');
+export const optionsLine = (s) => `${s.maxParallel ?? AT_ONCE_DEFAULT} at once${s.autoMerge ? ' · merge when green' : ''}${extraWords(s)}`;
 
 // An agent's row on Agents.
 export const agentState = (a) => (!a.installed ? 'not installed' : !a.enabled ? 'switched off' : a.signedIn === false ? 'not signed in' : 'ready');
@@ -998,10 +999,21 @@ export function repoValuesText(v) {
   return parts.join('; ');
 }
 
-// The pane's notice after Start: what it saved for the repo from the draft's proposal, if anything.
-export const startedNotice = (applied) => {
+// The commit a started sprint's copies start from, and whether Start checked it against the remote; null without one.
+export function startedFromLine(s) {
+  const from = s?.startedFrom;
+  if (!from?.commit) return null;
+  const base = s.base ?? 'the base';
+  const how = from.checked && from.remote ? ` (checked against ${from.remote}/${base} at Start)` : ' (not checked against a remote)';
+  return `Copies start from ${base} at ${String(from.commit).slice(0, 7)}${how}`;
+}
+
+// The pane's notice after Start: the commit its copies start from, and what it saved for the repo from the draft's
+// proposal, if anything.
+export const startedNotice = (applied, sprint = null) => {
   const text = repoValuesText(applied);
-  return text ? `Started. Saved for this repo: ${text}.` : 'Started.';
+  const line = startedFromLine(sprint);
+  return `Started.${line ? ` ${line}.` : ''}${text ? ` Saved for this repo: ${text}.` : ''}`;
 };
 
 // Uncommitted changes Podium saved aside before cleaning a copy, and where to find them.

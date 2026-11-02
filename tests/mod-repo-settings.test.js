@@ -69,6 +69,11 @@ test('a draft\'s proposed commands and check: a short fold heading and an exact 
   assert.equal(startedNotice({ check: 'npm test' }), 'Started. Saved for this repo: full check "npm test".');
   assert.equal(startedNotice({}), 'Started.');
   assert.equal(startedNotice(undefined), 'Started.');
+  // A started sprint names the commit its copies start from, before what Start saved.
+  const s = { base: 'main', startedFrom: { commit: '1ecac46aaaabbbbccccdddd', remote: 'origin', checked: true } };
+  assert.equal(startedNotice({}, s), 'Started. Copies start from main at 1ecac46 (checked against origin/main at Start).');
+  assert.equal(startedNotice({ check: 'npm test' }, s), 'Started. Copies start from main at 1ecac46 (checked against origin/main at Start). Saved for this repo: full check "npm test".');
+  assert.equal(startedNotice({}, { base: 'main' }), 'Started.');
 });
 
 test('a sprint card carries a draft\'s proposal, and leaves it out when there is none', () => {

@@ -1,6 +1,6 @@
 {
   "name": "podium",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Orchestrator mod for Claude Code: dispatch work to any installed agent CLI and track it in one pane.",
   "license": "MIT",
   "author": "MadJag Studios",

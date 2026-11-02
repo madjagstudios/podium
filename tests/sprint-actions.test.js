@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Writable } from 'node:stream';
-import { createSprint, tick, locked, loadSprint, saveSprint, setPaused, retryTicket, assignTask, claimMessages, markMessages, refreshMessages, writeRenewal, adoptSprint, sprintSummary, setReadHook, CLAIM_MS } from '../engine/sprint.js';
+import { createSprint, tick, locked, loadSprint, saveSprint, setPaused, retryTicket, acceptTests,assignTask, claimMessages, markMessages, refreshMessages, writeRenewal, adoptSprint, sprintSummary, setReadHook, CLAIM_MS } from '../engine/sprint.js';
 import { listJobDirs, readJob } from '../engine/store.js';
 import { main } from '../engine/cli.js';
 import { setSetting } from '../engine/settings.js';
@@ -11,7 +11,7 @@ import { waitFor, scriptAgent, sprintWorld, tempRoot } from './helpers.js';
 import { ticketSteps, sprintStepLine } from '../mod/view.js';
 
 const T = (over = {}) => ({ key: 'ABC-11', title: 'Login form', type: 'feat', plan: 'docs/plan.md', agent: 'fa', reviewer: 'fr', ...over });
-const run = (root, id, env, until) => waitFor(async () => { const s = await tick(root, id, { env }); return until(s) ? s : null; }, { timeoutMs: 90_000, intervalMs: 150 });
+const run = (root, id, env, until, { timeoutMs = 90_000 } = {}) => waitFor(async () => { const s = await tick(root, id, { env }); return until(s) ? s : null; }, { timeoutMs, intervalMs: 150 });
 
 test('Pause lets the running step finish and starts nothing; Resume carries on', async () => {
   const { root, w } = sprintWorld();
@@ -63,6 +63,77 @@ test('Retry after "Review failed twice" runs a fix with the findings, and one mo
   const prompt = fs.readFileSync(path.join(listJobDirs(root).find((d) => d.endsWith(authors[2].id)), 'prompt.md'), 'utf8');
   assert.match(prompt, /Still broken\./);
 });
+
+test('Retry after the extra fix round for narrow findings does not grant another', async () => {
+  const { root, w } = sprintWorld();
+  const narrow = (what) => `${what}\nFINDINGS: high=0 medium=1 low=0 repeated=0\nVERDICT: fail`;
+  scriptAgent(root, 'fa', [{ write: 'a.txt' }, { write: 'a2.txt' }, { write: 'a3.txt' }, { write: 'a4.txt' }]);
+  scriptAgent(root, 'fr', [{ say: 'Broken.\nVERDICT: fail' }, { say: narrow('Focus outline missing.') }, { say: narrow('Still off.') }, { say: narrow('Not yet.') }]);
+  const s0 = await createSprint(root, { name: 'x', tickets: [T()] }, { cwd: w.repo });
+  // Six agent steps: room for a busy machine.
+  const parked = await run(root, s0.id, w.env, (s) => s.tickets[0].state === 'parked', { timeoutMs: 300_000 });
+  assert.equal(parked.tickets[0].reason, 'Review failed three times on task 1');
+  const r = await retryTicket(root, s0.id, 'ABC-11');
+  assert.equal(r.tickets[0].narrowFix, 0, 'a Retry keeps the task\'s extra round used');
+  const s = await run(root, s0.id, w.env, (x) => x.tickets[0].state === 'parked');
+  assert.equal(s.tickets[0].reason, 'Review failed again on task 1 after a retry');
+  assert.match(s.tickets[0].findings, /Not yet\./);
+  // By each step's title (its own prompt's first line): a follow-up's prompt.md also quotes earlier steps.
+  const titles = listJobDirs(root).map(readJob).filter((j) => j.sprint?.role === 'author').map((j) => j.title);
+  assert.equal(titles.length, 4);
+  assert.equal(titles.filter((x) => x === 'ABC-11 task 1: fix exactly what the reviewer found').length, 1, 'the retried fix is an ordinary one');
+});
+
+test("Accept on a fix that parked on its tests: the fix's reviewer is quoted the review's findings, not the test report", async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ write: 'a.txt' }, { write: 'a2.txt', tests: 'failed', say: 'FIX-REPORT-7Q' }]);
+  scriptAgent(root, 'fr', [{ say: 'Focus outline missing.\nVERDICT: fail' }, { say: 'VERDICT: pass' }]);
+  const s0 = await createSprint(root, { name: 'x', tickets: [T()] }, { cwd: w.repo });
+  const parked = await run(root, s0.id, w.env, (s) => s.tickets[0].state === 'parked', { timeoutMs: 300_000 });
+  assert.equal(parked.tickets[0].testsPark?.writer, 'fix', parked.tickets[0].reason);
+  await acceptTests(root, s0.id, 'ABC-11', 'Flaky on this machine.');
+  await run(root, s0.id, w.env, (s) => s.tickets[0].task > 0 || s.tickets[0].state === 'parked');
+  const reviews = reviewJobs(root);
+  assert.equal(reviews.length, 2);
+  assertQuotesReview(root, reviews[1]);
+});
+
+test('Accept on a fix that parked on its tests: a review cut off by a usage limit is quoted the same findings when it runs again', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ write: 'a.txt' }, { write: 'a2.txt', tests: 'failed', say: 'FIX-REPORT-7Q' }]);
+  scriptAgent(root, 'fr', [{ say: 'Focus outline missing.\nVERDICT: fail' }, { err: "You've hit your usage limit.", exit: 1 }, { say: 'VERDICT: pass' }]);
+  const s0 = await createSprint(root, { name: 'x', tickets: [T()] }, { cwd: w.repo });
+  const parked = await run(root, s0.id, w.env, (s) => s.tickets[0].state === 'parked', { timeoutMs: 300_000 });
+  assert.equal(parked.tickets[0].testsPark?.writer, 'fix', parked.tickets[0].reason);
+  await acceptTests(root, s0.id, 'ABC-11', 'Flaky on this machine.');
+  const waiting = await run(root, s0.id, w.env, (s) => s.tickets[0].state !== 'running');
+  assert.equal(waiting.tickets[0].state, 'waiting', waiting.tickets[0].reason);
+  assert.equal(waiting.tickets[0].resume, 'fix-review');
+  const later = Date.parse(waiting.tickets[0].retryAt) + 1000;
+  await waitFor(async () => {
+    const s = await tick(root, s0.id, { env: w.env, now: later });
+    return s.tickets[0].task > 0 || s.tickets[0].state === 'parked' ? s : null;
+  }, { timeoutMs: 90_000, intervalMs: 150 });
+  const reviews = reviewJobs(root);
+  assert.equal(reviews.length, 3);
+  assertQuotesReview(root, reviews[1]);
+  assertQuotesReview(root, reviews[2]);
+});
+
+const reviewJobs = (root) => listJobDirs(root).map(readJob).filter((j) => j.sprint?.role === 'reviewer').sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+
+// The fix's reviewer was quoted the first review's findings as the previous review, and the fix's report only as the writer's.
+function assertQuotesReview(root, job) {
+  const prompt = fs.readFileSync(path.join(listJobDirs(root).find((d) => d.endsWith(job.id)), 'prompt.md'), 'utf8');
+  // The section's quote, from its opening fence to the matching close (fences are longer than any they hold).
+  const lines = prompt.slice(prompt.indexOf('## The previous review found\n')).split('\n');
+  const fence = lines[2];
+  assert.match(fence, /^`{3,}$/);
+  const quoted = lines.slice(3, lines.indexOf(fence, 3)).join('\n');
+  assert.match(quoted, /Focus outline missing\.$/);
+  assert.doesNotMatch(quoted, /FIX-REPORT-7Q/, "the fix's own report is not the previous review");
+  assert.match(prompt, /FIX-REPORT-7Q/, 'it is still shown as the writer\'s report');
+}
 
 test('a retried ticket waits for a free slot: it never runs beyond sprintParallel', async () => {
   const { root, w } = sprintWorld();

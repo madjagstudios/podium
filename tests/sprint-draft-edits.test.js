@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Writable } from 'node:stream';
-import { draftSprint, createSprint, discardSprint, loadSprint, moveTicket, removeTicket, assignTicket, assignTask, setSprintOptions, stopTicket, MAX_AT_ONCE } from '../engine/sprint.js';
+import { draftSprint, createSprint, discardSprint, loadSprint, moveTicket, removeTicket, assignTicket, assignTask, setSprintOptions, stopTicket, sprintSummary, MAX_AT_ONCE, MAX_EXTRA_ROUNDS } from '../engine/sprint.js';
 import { main } from '../engine/cli.js';
 import { scriptAgent, sprintWorld } from './helpers.js';
 
@@ -67,6 +67,28 @@ test('Merge when green and At once (1 to 5) are set on the draft', async () => {
   await assert.rejects(setSprintOptions(root, id, {}), (e) => e.code === 'nothing-to-change');
 });
 
+test('Extra rounds (0 to 20) are set with the draft or on it, and the summary carries them only when there are some', async () => {
+  const { root, w } = sprintWorld();
+  for (const name of ['fa', 'fr']) scriptAgent(root, name, []);
+  const plain = await draftSprint(root, { name: 'Oct', tickets: [T()] }, { cwd: w.repo });
+  assert.equal(plain.extraRounds, 0);
+  assert.equal('extraRounds' in sprintSummary(root, plain), false);
+  const d = await draftSprint(root, { name: 'Oct', tickets: [T({ key: 'ABC-12' })], extraRounds: 4 }, { cwd: w.repo });
+  assert.equal(d.extraRounds, 4);
+  assert.equal(d.extraUsed, 0);
+  const summary = sprintSummary(root, d);
+  assert.deepEqual([summary.extraRounds, summary.extraUsed], [4, 0]);
+  assert.equal((await setSprintOptions(root, d.id, { extraRounds: '2' })).extraRounds, 2, 'the CLI passes a string');
+  assert.equal((await setSprintOptions(root, d.id, { extraRounds: 0 })).extraRounds, 0);
+  for (const bad of [-1, MAX_EXTRA_ROUNDS + 1, 1.5, 'x', '', true]) {
+    await assert.rejects(setSprintOptions(root, d.id, { extraRounds: bad }), (e) => e.code === 'bad-value' && e.message === `Extra rounds must be a whole number from 0 to ${MAX_EXTRA_ROUNDS}.`, String(bad));
+  }
+  await assert.rejects(draftSprint(root, { name: 'Oct', tickets: [T({ key: 'ABC-13' })], extraRounds: 21 }, { cwd: w.repo }), (e) => e.code === 'bad-value');
+  const { code, body } = await cli(root, ['sprint', 'options', '--id', d.id, '--extra-rounds', '3']);
+  assert.equal(code, 0, JSON.stringify(body));
+  assert.equal(loadSprint(root, d.id).extraRounds, 3);
+});
+
 test('once started, the draft edits are refused; a task that ran or a ticket that ended cannot be reassigned', async () => {
   const { root, w } = sprintWorld();
   for (const name of ['fa', 'fb', 'fr']) scriptAgent(root, name, []);
@@ -76,6 +98,7 @@ test('once started, the draft edits are refused; a task that ran or a ticket tha
   await assert.rejects(removeTicket(root, s.id, 'ABC-12'), started);
   await assert.rejects(assignTicket(root, s.id, 'ABC-12', { agent: 'fb' }), started);
   await assert.rejects(setSprintOptions(root, s.id, { atOnce: 2 }), started);
+  await assert.rejects(setSprintOptions(root, s.id, { extraRounds: 2 }), started);
   assert.equal((await assignTask(root, s.id, 'ABC-12', 1, { agent: 'fb' })).tickets[1].tasks[0].agent, 'fb', 'a task not yet run still can');
   await stopTicket(root, s.id, 'ABC-12');
   await assert.rejects(assignTask(root, s.id, 'ABC-12', 2, { agent: 'fa' }), (e) => e.code === 'ticket-ended');

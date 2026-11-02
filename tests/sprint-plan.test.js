@@ -68,6 +68,18 @@ test('a ticket with no plan is planned by its writer, in its copy on its branch,
   assert.deepEqual(sum.proposed, [{ n: 1, title: 'Add the export button' }, { n: 2, title: 'Write the CSV' }]);
 });
 
+test('a planning job\'s summary is the plan\'s path and its tasks, whatever the planner said', async () => {
+  const { root, w } = sprintWorld();
+  scriptAgent(root, 'fa', [{ write: FILE, content: PLAN2, say: '## Summary\nHook chatter only.' }]);
+  scriptAgent(root, 'fr', []);
+  const s0 = await createSprint(root, { name: 'Oct', tickets: [P()] }, { cwd: w.repo, session: 'chat-1' });
+  const s = await run(root, s0.id, w.env, settled);
+  assert.equal(s.tickets[0].state, 'plan-ready', s.tickets[0].reason);
+  const [plan] = jobsBy(root, 'author');
+  assert.equal(fs.readFileSync(path.join(findJobDir(root, plan.id), 'summary.md'), 'utf8'),
+    `Plan: ${FILE}\n2 tasks:\n1. Add the export button\n2. Write the CSV\n`);
+});
+
 // A sprint saved with a plan path in another folder keeps it: the path is read from the ticket.
 test('a ticket whose saved plan path is in another folder is planned there and its plan read from there', async () => {
   const OLD = 'notes/plans/abc-14.md';
@@ -141,7 +153,7 @@ test('a usage limit on the planning step waits, then plans again', async () => {
   scriptAgent(root, 'fr', []);
   const s0 = await createSprint(root, { name: 'Oct', tickets: [P()] }, { cwd: w.repo });
   const s1 = await run(root, s0.id, w.env, (s) => s.tickets[0].state === 'waiting');
-  assert.match(s1.tickets[0].reason, /^Fa hit a usage limit; trying again at \d\d:\d\d$/);
+  assert.match(s1.tickets[0].reason, /^Fa hit a usage limit; trying again at (\w{3} )?\d\d:\d\d$/);
   assert.equal(s1.tickets[0].resume, 'plan');
   const s2 = await run(root, s0.id, w.env, settled, () => NOW + RETRY_MS + 1000);
   assert.equal(s2.tickets[0].state, 'plan-ready');
@@ -447,7 +459,9 @@ test('Approve makes the plan\'s tasks the ticket\'s, with its writer and reviewe
   assert.equal(authors[1].followUpOf, authors[0].id, 'task 1 continues the plan\'s conversation');
   assert.equal(authors[1].worktree, authors[0].worktree);
   const reviews = jobsBy(root, 'reviewer');
-  assert.doesNotMatch(promptOf(root, reviews[0]), /export-to-csv\.md/, 'task 1 is reviewed on its own diff, not the plan');
+  // The writer's echoed report names the plan (the planning step's summary is its "Result of the last step"); the diff must not.
+  const reviewPrompt = promptOf(root, reviews[0]);
+  assert.doesNotMatch(reviewPrompt.slice(reviewPrompt.lastIndexOf('## The change')), /export-to-csv\.md/, 'task 1 is reviewed on its own diff, not the plan');
   assert.equal(reviews[1].agent, 'fb');
   // Both tasks reach the PR as one commit, named for the ticket (the plan stays in the copy's history).
   assert.deepEqual(w.git(w.remote, 'log', '--format=%s', `${w.git(w.repo, 'rev-parse', 'main')}..feat/abc-14-export-to-csv`).split('\n'), ['ABC-14: Export to CSV']);

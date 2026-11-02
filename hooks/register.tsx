@@ -493,7 +493,7 @@ const SPRINT_DONE = {
 async function sprintAct($: Engine, verb: 'start' | 'discard' | 'pause' | 'resume', id: string) {
   await update($, board, (cur) => ({ ...cur, confirm: null }))
   // Start says what it saved for the repo from the draft's proposal.
-  const ok = await sprintCall($, [verb, '--id', id], verb === 'start' ? (v) => startedNotice(v?.applied) : SPRINT_DONE[verb])
+  const ok = await sprintCall($, [verb, '--id', id], verb === 'start' ? (v) => startedNotice(v?.applied, v?.sprint) : SPRINT_DONE[verb])
   // A discarded draft has no board left to show; the list keeps the notice. Another sprint's board stays.
   const shown = await read($, view)
   if (ok && verb === 'discard' && shown.screen === 'sprint' && shown.id === id) await showScreen($, 'list')

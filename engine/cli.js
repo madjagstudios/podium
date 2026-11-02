@@ -18,7 +18,7 @@ import { removalPlan, uninstall } from './uninstall.js';
 import { openPr, pushPr, refreshPr, mergePr, setAutoMerge, watchAgain, postReview, fixPrompt, browsePr, flushSprintNews } from './pr.js';
 import { ensureWatch } from './pr-watch.js';
 import { suggestAdapter, testAdapter } from './adapters/admin.js';
-import { draftSprint, startSprint, discardSprint, sprintSummaries, sprintSummary, PANE_FINISHED, setPaused, retryTicket, addNote, acceptTests, reviewWithEvidence, stopTicket, syncTicket, answerCommits, assignTask, moveTicket, removeTicket, assignTicket, setAfter, setSprintOptions, claimMessages, markMessages, refreshMessages, archiveEnded, approvePlan, revisePlan, draftNotes, adoptSprint } from './sprint.js';
+import { draftSprint, startSprint, discardSprint, sprintSummaries, sprintSummary, PANE_FINISHED, setPaused, retryTicket, addNote, acceptTests, reviewWithEvidence, stopTicket, syncTicket, answerCommits, assignTask, moveTicket, removeTicket, assignTicket, setAfter, setSprintOptions, claimMessages, markMessages, refreshMessages, archiveEnded, approvePlan, revisePlan, draftNotes, baseNotes, adoptSprint } from './sprint.js';
 import { repoCiNotes } from './ci-steps.js';
 import { ensureSprints } from './sprint-run.js';
 
@@ -155,7 +155,7 @@ export async function main(argv, { stdout = process.stdout, stdin = process.stdi
           const check = proposedCheck !== undefined ? (proposedCheck || null) : repoSettings(settings, made.project).check;
           const ci = await repoCiNotes(made.repo, settings, made.project, { env, check }).catch(() => []);
           // What the draft proposed for the repo: saved only when the person presses Start.
-          out = { ...one(made), notes: [...draftNotes(made, settings), ...ci], proposed: made.proposed ?? {} };
+          out = { ...one(made), notes: [...draftNotes(made, settings), ...(await baseNotes(made).catch(() => [])), ...ci], proposed: made.proposed ?? {} };
         } else if (sub === 'start') {
           const started = await startSprint(root, need('id'));
           // What Start saved for the repo from the draft's proposal, so the reply can say so.
@@ -174,7 +174,11 @@ export async function main(argv, { stdout = process.stdout, stdin = process.stdi
         } else if (sub === 'retry') {
           // A note for the ticket's agents comes on stdin (--note -), as a plan's notes do.
           const note = opts.note === undefined ? null : opts.note === '-' ? await readAll(stdin) : need('note');
-          out = one(await retryTicket(root, need('id'), need('ticket'), { agent: opts.agent ?? null, note }));
+          const s = await retryTicket(root, need('id'), need('ticket'), { agent: opts.agent ?? null, note });
+          const t = s.tickets.find((x) => x.key === String(opts.ticket).toUpperCase());
+          // Whether the retry carried a note, so the caller can tell the person rather than assume it.
+          const added = String(note ?? '').trim() ? t.notes.at(-1) : null;
+          out = { ...one(s), retried: { key: t.key, note: added ? { n: added.n, chars: added.text.length } : null } };
           keepRunning(root, spawn);
         } else if (sub === 'evidence') {
           // Review again with evidence: the person's words, on stdin.
@@ -221,8 +225,9 @@ export async function main(argv, { stdout = process.stdout, stdin = process.stdi
           out = one(await removeTicket(root, need('id'), need('ticket')));
         } else if (sub === 'options') {
           const on = (v) => (v === undefined ? undefined : v === true || v === 'true' || v === 'on');
-          // need() refuses a bare --at-once, which would otherwise read as 1.
-          out = one(await setSprintOptions(root, need('id'), { mergeWhenGreen: on(opts['merge-when-green']), atOnce: opts['at-once'] === undefined ? undefined : need('at-once') }));
+          // need() refuses a bare --at-once or --extra-rounds, which would otherwise read as 1.
+          const value = (name) => (opts[name] === undefined ? undefined : need(name));
+          out = one(await setSprintOptions(root, need('id'), { mergeWhenGreen: on(opts['merge-when-green']), atOnce: value('at-once'), extraRounds: value('extra-rounds') }));
         } else if (sub === 'after') {
           // A draft ticket's "after": --keys A,B (or none), --add KEY, --drop KEY.
           const keys = opts.keys === undefined ? null : need('keys') === 'none' ? [] : String(opts.keys).split(',').map((k) => k.trim()).filter(Boolean);

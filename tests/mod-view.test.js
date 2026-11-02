@@ -716,6 +716,8 @@ test('who works on a ticket, in one line', () => {
   assert.equal(whoLine(tk({ writers: ['muse'], reviewers: ['codex'] })), 'Muse writes, Codex reviews');
   assert.equal(optionsLine(sp([])), '3 at once');
   assert.equal(optionsLine(sp([], { autoMerge: true, maxParallel: null })), '3 at once · merge when green');
+  assert.equal(optionsLine(sp([], { extraRounds: 1 })), '3 at once · 1 extra round');
+  assert.equal(optionsLine(sp([], { extraRounds: 4, extraUsed: 2 })), '3 at once · 4 extra rounds (2 used)');
 });
 
 test('agents, setup and settings say their state in their heading', () => {
@@ -978,4 +980,14 @@ test('a ticket parked on a locked file says what to release and how to retry; an
   }
   // A lock without a usable filename still guides, without naming a guess.
   assert.match(checkpointLockHint({ ...parked, checkpointLock: { hint: null } }), /^an unidentified file is still open in a program/);
+});
+
+test('startedFromLine names the commit a started sprint\'s copies start from, and whether Start checked it', async () => {
+  const { startedFromLine } = await import('../mod/view.js');
+  const commit = '1ecac46aaaabbbbccccddddeeeeffff000011112';
+  assert.equal(startedFromLine({ base: 'main', startedFrom: { commit, remote: 'origin', checked: true } }), 'Copies start from main at 1ecac46 (checked against origin/main at Start)');
+  assert.equal(startedFromLine({ base: 'main', startedFrom: { commit, remote: 'origin', checked: false } }), 'Copies start from main at 1ecac46 (not checked against a remote)');
+  assert.equal(startedFromLine({ base: 'main', startedFrom: { commit, remote: null, checked: false } }), 'Copies start from main at 1ecac46 (not checked against a remote)');
+  assert.equal(startedFromLine({ base: 'main', draft: true }), null);
+  assert.equal(startedFromLine(null), null);
 });

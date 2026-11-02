@@ -85,6 +85,10 @@ export const BUILTIN_ADAPTERS = [
     // and in -p no one answers the prompt any other command needs. Names are plain words (settings.js), so each rule
     // passes assertArg. Headless Claude on Windows runs shell commands with its PowerShell tool, so both tools get a rule.
     allow: { flag: '--allowedTools', rules: ['Bash({cmd}:*)', 'PowerShell({cmd}:*)'] },
+    // Headless jobs skip the person's hooks: a hook written for interactive sessions (a Stop reminder) fires at the end of
+    // every job, and Claude answers it instead of ending with the reply Podium reads. Passed as a file (the runner writes
+    // `content` as JSON into the job's folder): JSON on the command line would need quotes.
+    settings: { flag: '--settings', content: { disableAllHooks: true } },
     unattended: {
       'own-config': { kind: 'skip', message: `In the background Claude refuses actions that would normally ask you first, so it may skip steps. ${SAFER}` },
     },

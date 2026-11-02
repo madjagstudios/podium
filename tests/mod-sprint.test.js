@@ -40,6 +40,7 @@ test('the sprint tool maps to the CLI', () => {
   const draft = engineCall('sprint', { action: 'draft', name: 'Oct', tickets: [{ key: 'ABC-11', plan: 'p.md', agent: 'codex', reviewer: 'claude' }], mergeWhenGreen: true });
   assert.deepEqual(draft.args, ['sprint', 'draft', '--json', '-']);
   assert.deepEqual(JSON.parse(draft.stdin), { name: 'Oct', tickets: [{ key: 'ABC-11', plan: 'p.md', agent: 'codex', reviewer: 'claude' }], mergeWhenGreen: true });
+  assert.equal(JSON.parse(engineCall('sprint', { action: 'draft', name: 'Oct', tickets: [], extraRounds: 3 }).stdin).extraRounds, 3);
   assert.deepEqual(engineCall('sprint', { action: 'start', id: 's1' }).args, ['sprint', 'start', '--id', 's1']);
   assert.deepEqual(engineCall('sprint', { action: 'discard', id: 's1' }).args, ['sprint', 'discard', '--id', 's1']);
   assert.throws(() => engineCall('sprint', { action: 'start', name: 'Oct', tickets: [] }), { message: 'Say which sprint to start (its id). To make a new sprint, use action "draft".' });
@@ -147,10 +148,11 @@ test('the sprint tool makes the draft board\'s changes', () => {
   assert.throws(() => engineCall('sprint', { action: 'remove', id: 's1' }), { message: 'Say which ticket.' });
   assert.deepEqual(engineCall('sprint', { action: 'remove', id: 's1', ticket: 'ABC-12' }).args, ['sprint', 'remove', '--id', 's1', '--ticket', 'ABC-12']);
   assert.deepEqual(engineCall('sprint', { action: 'options', id: 's1', mergeWhenGreen: false, atOnce: 2 }).args, ['sprint', 'options', '--id', 's1', '--merge-when-green', 'false', '--at-once', '2']);
-  assert.throws(() => engineCall('sprint', { action: 'options', id: 's1' }), { message: 'Say what to change: mergeWhenGreen or atOnce.' });
+  assert.deepEqual(engineCall('sprint', { action: 'options', id: 's1', extraRounds: 0 }).args, ['sprint', 'options', '--id', 's1', '--extra-rounds', '0']);
+  assert.throws(() => engineCall('sprint', { action: 'options', id: 's1' }), { message: 'Say what to change: mergeWhenGreen, atOnce or extraRounds.' });
   const tool = TOOLS.find((t) => t.name === 'sprint');
   for (const a of ['move', 'remove', 'options']) assert.ok(tool.inputSchema.properties.action.enum.includes(a), a);
-  assert.match(tool.description, /"options" \(mergeWhenGreen and\/or atOnce/);
+  assert.match(tool.description, /"options" \(mergeWhenGreen, atOnce and\/or extraRounds/);
   assert.match(tool.description, /"stop" \(id, ticket\): end a ticket the user has given up on; its branch is kept/);
 });
 

@@ -1,5 +1,5 @@
-// Pure text for sprints: a plan's tasks, the prompt each step gets, a
-// reviewer's verdict, and whether an agent stopped on a usage limit.
+// Pure text for sprints: a plan's tasks, the prompt each step gets, and a
+// reviewer's verdict.
 import { slugOf } from './pr.js';
 
 export const DIFF_LIMIT = 60_000;
@@ -324,6 +324,48 @@ export function verdictOf(output) {
   return { verdict: m[1].toLowerCase(), findings: text.slice(0, last.start).trim().slice(-4000) };
 }
 
+// A reviewer's count of its findings by severity, on its own line above the verdict:
+// `FINDINGS: high=<n> medium=<n> low=<n> repeated=<n>` (repeated: how many the previous review already raised; 0 when
+// there was none). Read as verdictOf reads the verdict: the last such line outside fences and quotes, so an echoed prompt
+// or a quoted review never counts. null when there is none, or when any of the four counts is missing or not a number.
+export const FINDINGS_LINE = 'Above the verdict, on its own line, count your findings by severity: `FINDINGS: high=<n> medium=<n> low=<n> repeated=<n>`, where repeated is how many of them the previous review (quoted below, when there was one) already raised; use 0 when there was none.';
+const FINDINGS = /^[ \t]*(?:[-*+][ \t]+)?[*_`]*FINDINGS[*_`]*:[ \t*_`]*(.*)$/i;
+const FINDING_KEYS = ['high', 'medium', 'low', 'repeated'];
+
+// One line's counts, or null: every pair is key=<whole number>, each of the four keys once, nothing else.
+function countsOf(rest) {
+  const body = rest.replace(/[ \t*_`.]*$/, '').trim();
+  if (!body) return null;
+  const counts = {};
+  for (const part of body.replace(/[ \t]*=[ \t]*/g, '=').split(/[\s,]+/).filter(Boolean)) {
+    const m = part.match(/^([a-z]+)=(\d+)$/i);
+    if (!m) return null;
+    const key = m[1].toLowerCase();
+    if (!FINDING_KEYS.includes(key) || key in counts) return null;
+    counts[key] = Number(m[2]);
+  }
+  return FINDING_KEYS.every((k) => k in counts) ? counts : null;
+}
+
+export function findingsOf(output) {
+  let found = null;
+  for (const { line } of outsideFences(String(output ?? ''))) {
+    const m = line.match(FINDINGS);
+    const counts = m ? countsOf(m[1]) : null;
+    if (counts) found = { high: counts.high, medium: counts.medium, low: counts.low, repeated: counts.repeated };
+  }
+  return found;
+}
+
+// A failed review's findings are narrow when another fix round is likely to settle them: nothing high, one to
+// NARROW_FINDINGS findings in all, and none the previous review already raised. Unknown counts (null) are never narrow.
+export const NARROW_FINDINGS = 3;
+export function narrowFindings(counts) {
+  if (!counts) return false;
+  const n = counts.medium + counts.low;
+  return counts.high === 0 && counts.repeated === 0 && n >= 1 && n <= NARROW_FINDINGS;
+}
+
 // What a writer says about its tests: the writer and fix prompts end with TESTS_LINE, and testsOf reads the last
 // such line outside code fences and quotes, as verdictOf reads a verdict, so an echoed prompt or a quoted report never
 // counts. It need not be the very last line (a CLI footer may follow). The line starts with TESTS: (a list bullet or bold
@@ -461,11 +503,6 @@ export function ticketSection(ticket) {
   ];
 }
 
-const LIMIT = /usage limit|rate[ -]?limit(?:ed|s? (?:reached|exceeded|hit))|too many requests|\b(?:HTTP|status|error)[: ]+429\b|quota (?:exceeded|reached)|exceeded your (?:current )?quota|out of credits/i;
-export function isUsageLimit(text) {
-  return LIMIT.test(String(text ?? ''));
-}
-
 export function ticketBranch(type, key, title) {
   const kind = String(type ?? '').toLowerCase();
   return `${/^[a-z]+$/.test(kind) ? kind : 'feat'}/${String(key).toLowerCase()}-${slugOf(title)}`;
@@ -511,12 +548,15 @@ export function authorPrompt(ticket, task) {
   ].join('\n');
 }
 
-export function fixPrompt(ticket, task, findings) {
+// exact: an extra round for a few narrow findings, told to fix exactly those and nothing else.
+export function fixPrompt(ticket, task, findings, { exact = false } = {}) {
   const said = findings && findings.trim() ? findings.trim() : '(no details)';
   return [
-    `${ticket.key} task ${task.n}: fix what the reviewer found`,
+    exact ? `${ticket.key} task ${task.n}: fix exactly what the reviewer found` : `${ticket.key} task ${task.n}: fix what the reviewer found`,
     '',
-    `A reviewer checked the work on task ${task.n} (${task.title}) and found problems. Fix them, keep the change small, and run the tests again.`,
+    exact
+      ? `A reviewer checked the fix on task ${task.n} (${task.title}) and found a few narrow problems, quoted below. Fix exactly these, and nothing else: keep the change as small as they allow, and run the tests again.`
+      : `A reviewer checked the work on task ${task.n} (${task.title}) and found problems. Fix them, keep the change small, and run the tests again.`,
     "Do not commit: Podium commits this task's changes itself. If the plan has a commit step, skip it.",
     CHANGES_LINE,
     ...ticketSection(ticket),
@@ -587,7 +627,9 @@ function testsLines({ tests, host, preexisting, accepted }) {
 // ({ command, log, baseLog }): the reviewer fails the task only for failures this change caused.
 // evidence: what the person gave the reviewer to weigh (Review again with evidence), quoted.
 // changes: the writer's word that the task needed no change (changesOf), quoted for the reviewer to judge.
-export function reviewerPrompt(ticket, task, diff, copy, { report = '', tests = null, host = null, preexisting = null, accepted = [], evidence = [], changes = null } = {}) {
+// previous: the findings of the review whose fix this one checks, quoted so the reviewer can count repeats.
+export function reviewerPrompt(ticket, task, diff, copy, { report = '', tests = null, host = null, preexisting = null, accepted = [], evidence = [], changes = null, previous = null } = {}) {
+  const before = typeof previous === 'string' && previous.trim() ? previous.trim().slice(-4000) : null;
   const text = String(diff ?? '');
   const shown = text.length > DIFF_LIMIT ? `${text.slice(0, DIFF_LIMIT)}\n… (cut: the whole change is in the copy)` : text;
   const reported = String(report ?? '').trim().slice(-REPORT_CHARS) || '(the writer said nothing)';
@@ -598,6 +640,7 @@ export function reviewerPrompt(ticket, task, diff, copy, { report = '', tests = 
     "Judge the task's change (the diff) against the task. Ignore commit messages, commit steps and how the change was committed: Podium makes the commits, so never fail a task for them.",
     'Check the change against the task, and against what the ticket below asks of the part this task covers (its acceptance, where the task covers it; later tasks do the rest): is it complete and correct, and does it have the tests the task asks for? List problems by severity (high, medium, low), each with file:line.',
     'Say pass only if nothing needs fixing before the next task.',
+    'Severity: high is wrong or broken behaviour the task needs, or a missing test the task asks for; medium is a real problem that is narrower; low is polish or style. Low findings alone, or an edge case that is very unlikely in real use, are not a reason to fail: list them and pass.',
     ...testsLines({ tests, host, preexisting, accepted }),
     ...(changes?.why
       ? [
@@ -612,6 +655,7 @@ export function reviewerPrompt(ticket, task, diff, copy, { report = '', tests = 
           fenced(evidence.map((x) => String(x).trim()).join('\n\n')),
         ]
       : []),
+    FINDINGS_LINE,
     DOTNET_INSTRUCTION,
     'End your answer with the verdict as the very last line, on its own: VERDICT: <pass or fail>. Put your findings above it.',
     ...ticketSection(ticket),
@@ -621,6 +665,14 @@ export function reviewerPrompt(ticket, task, diff, copy, { report = '', tests = 
     fenced(String(task.text ?? task.title)),
     ...ciSection(ticket, 'reviewer'),
     ...notesSection(ticket, 'reviewer'),
+    ...(before
+      ? [
+          '',
+          '## The previous review found',
+          'This review checks a fix for these findings. Count in `repeated` the findings of yours that are the same problem as one of these, still not fixed.',
+          fenced(before),
+        ]
+      : []),
     '',
     '## The writer reported',
     fenced(reported),
@@ -685,6 +737,22 @@ function quoteOf(notes) {
 // happened, in one line). `where` is the plan in Podium's copy: Claude must read it there, not in the person's folder.
 // `asked`: the person's notes when the plan was changed after Ask for changes (the same "ready"
 // message twice read as a change the person never asked for).
+// A planning job's summary, once its plan is read: the plan's path and its task titles (at most SUMMARY_TASKS, then
+// how many more), or that no tasks were found.
+export const SUMMARY_TASKS = 10;
+export function planJobSummary(ticket) {
+  const head = `Plan: ${ticket.plan}`;
+  if (ticket.state !== 'plan-ready') return `${head}\nPodium couldn't find "### Task N:" headings in it.`;
+  const tasks = ticket.proposed ?? [];
+  const n = tasks.length;
+  return [
+    head,
+    `${n} task${n === 1 ? '' : 's'}:`,
+    ...tasks.slice(0, SUMMARY_TASKS).map((x) => `${x.n}. ${x.title}`),
+    ...(n > SUMMARY_TASKS ? [`and ${n - SUMMARY_TASKS} more`] : []),
+  ].join('\n');
+}
+
 export function planNews(sprintId, ticket, where, { asked = null } = {}) {
   const changed = asked && String(asked).trim() ? `${ticket.key}'s plan was changed after your notes ("${quoteOf(asked)}")` : null;
   const about = `The ticket is ${ticket.key} (${ticket.title}).`;

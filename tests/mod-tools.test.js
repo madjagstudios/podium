@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { TOOLS, engineCall, formatToolResult } from '../mod/tools.js';
+import { TOOLS, engineCall, formatToolResult, ignoredFields } from '../mod/tools.js';
 
 test('nine tools, dispatch defaults explained', () => {
   assert.deepEqual(TOOLS.map((t) => t.name), ['dispatch', 'pr', 'status', 'result', 'cancel', 'keep', 'discard', 'agents', 'sprint']);
@@ -89,6 +89,49 @@ test('the sprint tool\'s note goes by stdin, as does a retry\'s, and its reply s
   assert.match(said.description, /never add a note on your own/);
 });
 
+test('a retry keeps its note sent as note, and the reply says whether one went with it', () => {
+  assert.deepEqual(engineCall('sprint', { action: 'retry', id: 's1', ticket: 'ABC-11', note: ' Restructure it. ' }),
+    { args: ['sprint', 'retry', '--id', 's1', '--ticket', 'ABC-11', '--note', '-'], stdin: 'Restructure it.' });
+  assert.deepEqual(engineCall('sprint', { action: 'retry', id: 's1', ticket: 'ABC-11', text: 'Restructure it.', note: ' Restructure it.' }),
+    { args: ['sprint', 'retry', '--id', 's1', '--ticket', 'ABC-11', '--note', '-'], stdin: 'Restructure it.' });
+  assert.throws(() => engineCall('sprint', { action: 'retry', id: 's1', ticket: 'ABC-11', text: 'One thing.', note: 'Another.' }), /Give the words once/);
+  // The other actions that take the person's words read note too.
+  for (const [action, sub] of [['note', 'note'], ['revise', 'revise'], ['accept', 'accept'], ['evidence', 'evidence']]) {
+    assert.deepEqual(engineCall('sprint', { action, id: 's1', ticket: 'ABC-11', note: ' Their words. ' }),
+      { args: ['sprint', sub, '--id', 's1', '--ticket', 'ABC-11', '--text', '-'], stdin: 'Their words.' }, action);
+  }
+  assert.throws(() => engineCall('sprint', { action: 'note', id: 's1', ticket: 'ABC-11', note: '  ' }), { message: 'Say what the note is (text).' });
+  const sprint = { id: 's1', name: 'Oct', base: 'main', paused: false, finishedAt: null, autoMerge: false, news: 0, tickets: [] };
+  assert.match(formatToolResult('sprint', { ok: true, value: { sprint, retried: { key: 'ABC-11', note: { n: 4, chars: 15 } } } }, { action: 'retry' }),
+    /\n\nRetried ABC-11 with your note \(note 4, 15 characters\): the retried step reads it\.$/);
+  assert.match(formatToolResult('sprint', { ok: true, value: { sprint, retried: { key: 'ABC-11', note: null } } }, { action: 'retry' }),
+    /\n\nRetried ABC-11 with no note\. To give the retried step instructions, retry with text\.$/);
+  assert.doesNotMatch(formatToolResult('sprint', { ok: true, value: { sprint } }, { action: 'retry' }), /Retried/);
+  const said = TOOLS.find((t) => t.name === 'sprint').description;
+  assert.ok(!said.includes('added as "note" adds one'));
+  assert.ok(said.includes('the reply says whether a note went with the retry'));
+});
+
+test('every tool names the fields it ignored, and its schema allows no others', () => {
+  assert.deepEqual(ignoredFields('sprint', { tool: 'mcp__podium__sprint', action: 'retry', note: 'x', foo: 1, bar: 2 }), ['bar', 'foo']);
+  assert.deepEqual(ignoredFields('dispatch', { agent: 'codex', task: 'x', note: 'y' }), ['note']);
+  assert.deepEqual(ignoredFields('agents', { tool: 'mcp__podium__agents' }), []);
+  assert.deepEqual(ignoredFields('fly', { a: 1 }), []);
+  assert.deepEqual(ignoredFields('status', null), []);
+  const cancelled = { ok: true, value: { job: { id: 'j1', status: 'cancelled' } } };
+  assert.ok(formatToolResult('cancel', cancelled, { id: 'j1', reason: 'x' }).endsWith("\n\nPodium ignored a field this tool doesn't have: reason."));
+  assert.equal(formatToolResult('cancel', cancelled, { id: 'j1' }), 'Job j1 is now cancelled.');
+  assert.equal(formatToolResult('cancel', cancelled, { tool: 'mcp__podium__cancel', id: 'j1' }), 'Job j1 is now cancelled.');
+  assert.equal(formatToolResult('cancel', cancelled), 'Job j1 is now cancelled.');
+  assert.match(formatToolResult('cancel', { ok: false, error: { code: 'not-found', message: 'No such job.' } }, { id: 'j9', why: 1, reason: 'x' }),
+    /^Podium could not do that \(not-found\): No such job\.\n\nPodium ignored fields this tool doesn't have: reason, why\.$/);
+  for (const t of TOOLS) assert.equal(t.inputSchema.additionalProperties, false, t.name);
+  // Declared, so a host that checks the schema lets it through to the handler; its description steers callers to text.
+  const props = TOOLS.find((t) => t.name === 'sprint').inputSchema.properties;
+  assert.deepEqual(props.note, { type: 'string', description: 'Another name for text (send text).' });
+  assert.ok(props.text);
+});
+
 test('dispatch passes a starting branch', () => {
   const call = engineCall('dispatch', { agent: 'codex', task: 'Review', base: 'feat/oc-11-chapter-3' });
   const i = call.args.indexOf('--base');
@@ -139,6 +182,17 @@ test('badly typed commands or check go to the engine as given, so it refuses the
     if (check !== undefined) assert.deepEqual(sent.check, check);
     else assert.equal('check' in sent, false);
   }
+});
+
+test('the Start reply names the commit the sprint\'s copies start from; a status reply does not', () => {
+  const s = { id: 's1', name: 'Oct', draft: false, discarded: false, paused: false, finishedAt: null, autoMerge: false, maxParallel: 3, news: 0, base: 'main', tickets: [],
+    startedFrom: { commit: '1ecac46aaaabbbbccccddddeeeeffff000011112', remote: 'origin', checked: true } };
+  const line = 'Copies start from main at 1ecac46 (checked against origin/main at Start).';
+  const started = formatToolResult('sprint', { ok: true, value: { sprint: s, applied: { check: 'npm test' } } }, { action: 'start', id: 's1' });
+  assert.ok(started.endsWith(`Saved for this repo at Start: full check "npm test".\n\n${line}`), started);
+  assert.ok(!formatToolResult('sprint', { ok: true, value: { sprint: s } }, { action: 'status', id: 's1' }).includes('Copies start from'));
+  const older = { ...s, startedFrom: undefined };
+  assert.ok(!formatToolResult('sprint', { ok: true, value: { sprint: older, applied: {} } }, { action: 'start', id: 's1' }).includes('Copies start from'));
 });
 
 test('the sprint draft carries the repo\'s commands and check, and the reply says they are proposed until Start', () => {

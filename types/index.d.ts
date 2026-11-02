@@ -82,6 +82,8 @@ export type SprintSummary = {
   maxParallel?: number | null; news: number; unreadable?: string; tickets: SprintTicketSummary[];
   // The branch its tickets start from and their PRs target.
   base?: string;
+  /** The commit Start checked, which every ticket without "after" starts from. Absent on drafts and older sprints. */
+  startedFrom?: { commit: string; remote: string | null; checked: boolean };
   // Sent as its card only (desktop): no tasks or review findings.
   brief?: boolean;
   // Omitted ticket count, plus headline and status for the whole sprint (capRows).

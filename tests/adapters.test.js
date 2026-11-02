@@ -119,6 +119,26 @@ test('an adapter\'s allow rule is checked like its other arguments', () => {
   assert.ok(validateAdapter({ ...fakeAdapter(), allow: { flag: '--allow', rules: ['Bash({cmd}:*)', 'Run({cmd})&'] } }).some((e) => e.includes('Refusing')));
 });
 
+test('Claude starts with its settings layer when given the file, before its allow rules', () => {
+  const FILE = '/jobs/1/agent-settings.json';
+  assert.deepEqual(claude.settings, { flag: '--settings', content: { disableAllHooks: true } });
+  assert.deepEqual(buildInvocation(claude, { permission: 'edit-worktree', settingsFile: FILE }).args,
+    ['-p', '--settings', FILE, '--permission-mode', 'acceptEdits']);
+  assert.deepEqual(buildInvocation(claude, { permission: 'edit-worktree', allow: ['npm'], settingsFile: FILE, session: { mode: 'continue', id: ID } }).args,
+    ['-p', '--resume', ID, '--settings', FILE, '--permission-mode', 'acceptEdits', '--allowedTools', 'Bash(npm:*)', 'PowerShell(npm:*)']);
+  assert.deepEqual(buildInvocation(claude, { permission: 'edit-worktree' }).args, ['-p', '--permission-mode', 'acceptEdits']);
+  assert.doesNotMatch(buildInvocation(codex, { permission: 'edit-worktree', settingsFile: FILE }).args.join(' '), /--settings/);
+  assert.doesNotMatch(buildInvocation(codex, { permission: 'edit-worktree', settingsFile: FILE, session: { mode: 'continue', id: ID } }).args.join(' '), /--settings/);
+  assert.throws(() => buildInvocation(claude, { permission: 'edit-worktree', settingsFile: '/jobs/a&b/s.json' }), (e) => e.code === 'unsafe-arg');
+});
+
+test('an adapter\'s settings layer is checked like its other arguments', () => {
+  assert.ok(validateAdapter({ ...fakeAdapter(), settings: { flag: '--settings' } }).some((e) => e.includes('settings')));
+  assert.ok(validateAdapter({ ...fakeAdapter(), settings: { flag: '--settings', content: [] } }).some((e) => e.includes('settings')));
+  assert.ok(validateAdapter({ ...fakeAdapter(), settings: { flag: 'a&b', content: {} } }).some((e) => e.includes('Refusing')));
+  assert.deepEqual(validateAdapter({ ...fakeAdapter(), settings: { flag: '--settings', content: { disableAllHooks: true } } }), []);
+});
+
 test('a stored command list that is not a list is ignored, and a single-rule adapter still works', () => {
   const claude = BUILTIN_ADAPTERS.find((a) => a.name === 'claude');
   for (const bad of ['dotnet', { 0: 'dotnet' }, null, 7]) {
